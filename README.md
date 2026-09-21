@@ -137,6 +137,5 @@ events (done) → mesh colliders → character controller.
 
 ## License
 
-Licensed under the [Mozilla Public License 2.0](LICENSE).
-
-Jolt Physics itself is MIT-licensed; see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+Licensed under the [MIT License](LICENSE), same as Jolt Physics itself; see
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for Jolt's own notice.
