@@ -93,6 +93,8 @@ final class JoltCharacterTests: XCTestCase {
         // Wall face at 0.95, radius 0.2, padding 0.02: the centre stops at 0.73.
         XCTAssertEqual(character.position.x, 0.73, accuracy: 0.03)
         XCTAssertEqual(character.position.z, 0, accuracy: 0.01)
+        // Pinned: the produced velocity is zero, whatever was asked.
+        XCTAssertEqual(simd_length(character.velocity), 0, accuracy: 0.05)
         let touching = character.contacts().filter { $0.entity == JoltPhysicsBackend.environmentEntity && $0.normal.x < -0.9 }
         XCTAssertFalse(touching.isEmpty, "the wall should be among the contacts")
 
@@ -100,6 +102,53 @@ final class JoltCharacterTests: XCTestCase {
         walk(character, backend, velocity: simd_float3(1, 0, 1), seconds: 1)
         XCTAssertEqual(character.position.x, 0.73, accuracy: 0.03)
         XCTAssertEqual(character.position.z, 1, accuracy: 0.05)
+        XCTAssertEqual(character.velocity.x, 0, accuracy: 0.05)
+        XCTAssertEqual(character.velocity.z, 1, accuracy: 0.05)
+    }
+
+    func testTriggerVolumesAreNotContactsAndManyContactsAreAllListed() {
+        let backend = makeBackend(wall: false)
+        // A trigger around the origin, and a ring of forty thin posts just
+        // outside the shape (within its predictive contact distance).
+        backend.didAddBody(entity: 500, descriptor: PhysicsBodyDescriptor(
+            motionType: .static,
+            collider: PhysicsColliderDescriptor(shape: .box(halfExtents: simd_float3(1, 1, 1)), isTrigger: true),
+            position: simd_float3(0, 1, 0)
+        ))
+        var posts: [JoltEnvironmentBox] = []
+        for index in 0 ..< 40 {
+            let angle = Float(index) / 40 * 2 * .pi
+            posts.append(JoltEnvironmentBox(
+                center: simd_float3(cos(angle) * 0.27, 0.9, sin(angle) * 0.27),
+                orientation: simd_quatf(angle: -angle, axis: simd_float3(0, 1, 0)),
+                halfExtents: simd_float3(0.005, 0.9, 0.01)
+            ))
+        }
+        backend.setEnvironmentBoxes(posts)
+        backend.step(deltaTime: step)
+        let character = makeCharacter(backend)
+        character.move(velocity: .zero, deltaTime: step)
+
+        let contacts = character.contacts()
+        XCTAssertFalse(contacts.contains { $0.entity == 500 }, "the trigger is not geometry")
+        XCTAssertGreaterThan(contacts.count, 32, "every post is listed, past the initial scratch")
+        // The posts, and the floor it stands on (entity 1000): nothing else.
+        XCTAssertTrue(contacts.allSatisfy { $0.entity == JoltPhysicsBackend.environmentEntity || $0.entity == 1000 })
+    }
+
+    func testZeroStrengthNeverPushes() throws {
+        let backend = makeBackend(wall: false)
+        backend.didAddBody(entity: 7, descriptor: ball(at: simd_float3(0.6, 0.11, 0)))
+        backend.step(deltaTime: step)
+        var descriptor = JoltCharacterDescriptor(radius: radius, height: height)
+        descriptor.entity = zombie
+        descriptor.maxStrength = 0
+        let character = try XCTUnwrap(backend.addCharacter(descriptor))
+
+        walk(character, backend, velocity: simd_float3(1.5, 0, 0), seconds: 0.5)
+        // Blocked by a ball it cannot push (the inner body only nudges it).
+        XCTAssertLessThan(backend.bodyState(for: 7)?.position.x ?? 0, 0.8)
+        XCTAssertLessThan(character.position.x, 0.45)
     }
 
     func testCylinderKeepsItsHeightAgainstALowBox() {

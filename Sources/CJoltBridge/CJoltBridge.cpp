@@ -123,6 +123,8 @@ struct ujolt_character final : public CharacterContactListener {
     CharacterVirtual::ExtendedUpdateSettings extended;
     ujolt_body_id innerBody = UJOLT_INVALID_BODY;
     bool pushedByDynamicBodies = false;
+    /// What the last move produced: displacement over its dt.
+    Vec3 effectiveVelocity = Vec3::sZero();
 
     // Synchronous, on the thread running the move. With mCanPushCharacter
     // off Jolt drops the constraint's velocity (the body's own and the
@@ -865,7 +867,11 @@ RefConst<Shape> characterShape(ujolt_character_shape kind, float radius, float h
     return new RotatedTranslatedShape(Vec3(0.0f, height * 0.5f, 0.0f), Quat::sIdentity(), shape);
 }
 
+/// Fields Jolt cannot take at zero fall back to the default at or below zero.
 inline float orDefault(float value, float fallback) { return value > 0.0f ? value : fallback; }
+/// Fields where zero is a meaningful choice (no mass, no push, every contact
+/// a wall) fall back only when negative.
+inline float orDefaultIfNegative(float value, float fallback) { return value >= 0.0f ? value : fallback; }
 
 } // namespace
 
@@ -876,19 +882,19 @@ ujolt_character *ujolt_world_add_character(ujolt_world *world, const ujolt_chara
 
     Ref<CharacterVirtualSettings> settings = new CharacterVirtualSettings();
     settings->mShape = characterShape(desc->shape, desc->radius, desc->height, 1.0f);
-    settings->mMass = orDefault(desc->mass, 70.0f);
-    settings->mMaxStrength = orDefault(desc->max_strength, 100.0f);
+    settings->mMass = orDefaultIfNegative(desc->mass, 70.0f);
+    settings->mMaxStrength = orDefaultIfNegative(desc->max_strength, 100.0f);
     settings->mCharacterPadding = orDefault(desc->padding, 0.02f);
     settings->mPredictiveContactDistance = orDefault(desc->predictive_contact_distance, 0.1f);
-    settings->mMaxSlopeAngle = DegreesToRadians(orDefault(desc->max_slope_degrees, 50.0f));
+    settings->mMaxSlopeAngle = DegreesToRadians(orDefaultIfNegative(desc->max_slope_degrees, 50.0f));
     settings->mPenetrationRecoverySpeed = orDefault(desc->penetration_recovery_speed, 1.0f);
     // Only the lower part of the shape can rest on something: a wall touched
     // at hip height is a wall, not ground.
     settings->mSupportingVolume = Plane(Vec3::sAxisY(), -desc->radius);
     settings->mBackFaceMode = EBackFaceMode::CollideWithBackFaces;
-    // The environment is many bodies meeting at seams (wall to floor, wall
-    // to wall); without this the character can catch on those edges.
-    settings->mEnhancedInternalEdgeRemoval = true;
+    // Only voids internal edges within ONE body (a mesh); the environment
+    // is separate convex boxes, where it would cost and change nothing.
+    settings->mEnhancedInternalEdgeRemoval = false;
     const ObjectLayer layer = objectLayer(desc->layer, true);
     if (desc->inner_body != 0) {
         settings->mInnerBodyShape = characterShape(desc->shape, desc->radius, desc->height,
@@ -926,11 +932,15 @@ void ujolt_world_remove_character(ujolt_world *world, ujolt_character *character
 void ujolt_character_move(ujolt_character *character, const float velocity[3], float dt, const float gravity[3]) {
     if (dt <= 0.0f) return;
     ujolt_world *world = character->world;
+    const RVec3 before = character->character->GetPosition();
     character->character->SetLinearVelocity(v3(velocity));
     character->character->ExtendedUpdate(dt, v3(gravity), character->extended,
                                          world->system.GetDefaultBroadPhaseLayerFilter(character->layer),
                                          world->system.GetDefaultLayerFilter(character->layer),
                                          BodyFilter(), ShapeFilter(), *world->temp);
+    // Jolt keeps the velocity it was given; what the move produced is the
+    // displacement (stopped at a wall it is zero, along one it is the slide).
+    character->effectiveVelocity = Vec3(character->character->GetPosition() - before) / dt;
 }
 
 void ujolt_character_set_position(ujolt_character *character, const float position[3]) {
@@ -950,7 +960,7 @@ void ujolt_character_get_position(const ujolt_character *character, float positi
 }
 
 void ujolt_character_get_velocity(const ujolt_character *character, float velocity[3]) {
-    store3(velocity, character->character->GetLinearVelocity());
+    store3(velocity, character->effectiveVelocity);
 }
 
 int32_t ujolt_character_ground_state(const ujolt_character *character) {
@@ -965,9 +975,12 @@ int32_t ujolt_character_ground_state(const ujolt_character *character) {
 uint32_t ujolt_character_contacts(const ujolt_character *character, ujolt_character_contact *out, uint32_t capacity) {
     uint32_t count = 0;
     for (const CharacterContact &contact : character->character->GetActiveContacts()) {
-        if (count >= capacity) break;
-        if (contact.mWasDiscarded) continue;
-        ujolt_character_contact &c = out[count++];
+        // Sensors are not solid to the character (Jolt only notifies), and
+        // one it merely overlaps is never even routed through the solver
+        // that would discard it: leave them out, they are not geometry.
+        if (contact.mWasDiscarded || contact.mIsSensorB) continue;
+        if (count++ >= capacity) continue;
+        ujolt_character_contact &c = out[count - 1];
         c.user_data = contact.mUserData;
         store3(c.position, Vec3(contact.mPosition));
         store3(c.normal, contact.mContactNormal);

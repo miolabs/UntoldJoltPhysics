@@ -229,11 +229,11 @@ typedef struct ujolt_character_desc {
     float rotation[4];                 /* x, y, z, w */
     uint32_t layer;                    /* engine collision layer 0..31 */
     uint64_t user_data;                /* the engine entity id; contacts and ray hits report it */
-    float mass;                        /* <= 0 -> 70 kg; pushes down what the character stands on */
-    float max_strength;                /* <= 0 -> 100 N; the most force applied to a pushed dynamic body */
+    float mass;                        /* kg, presses down on what the character stands on; 0 never does; < 0 -> 70 */
+    float max_strength;                /* N, the most force applied to a pushed dynamic body; 0 never pushes; < 0 -> 100 */
     float padding;                     /* <= 0 -> 0.02 m; the distance kept from every surface */
     float predictive_contact_distance; /* <= 0 -> 0.1 m; 0 would make the character stick */
-    float max_slope_degrees;           /* <= 0 -> 50; steeper contacts are walls */
+    float max_slope_degrees;           /* contacts steeper than this are walls; 0 makes every contact a wall; < 0 -> 50 */
     float penetration_recovery_speed;  /* <= 0 -> 1; fraction of a penetration resolved per move */
     int32_t inner_body;                /* 0/1: a kinematic body inside the shape, so dynamic bodies
                                           bounce off the character and rays hit it (registered with
@@ -247,6 +247,8 @@ typedef struct ujolt_character_desc {
     float walk_stairs_step_up;         /* metres the character may step up; 0 -> off */
 } ujolt_character_desc;
 
+/// A contact of the character with a body. Trigger volumes are never listed:
+/// the character passes through them.
 typedef struct ujolt_character_contact {
     uint64_t user_data;   /* the other body's entity (UJOLT_NO_ENTITY for environment geometry) */
     float position[3];
@@ -267,9 +269,12 @@ void ujolt_character_move(ujolt_character *character, const float velocity[3], f
 void ujolt_character_set_position(ujolt_character *character, const float position[3]);
 void ujolt_character_set_rotation(ujolt_character *character, const float rotation[4]);
 void ujolt_character_get_position(const ujolt_character *character, float position[3]);
+/// The velocity the last move actually produced — the displacement over its
+/// dt, after sliding and stopping — not the one asked for. Zero before any move.
 void ujolt_character_get_velocity(const ujolt_character *character, float velocity[3]);
 int32_t ujolt_character_ground_state(const ujolt_character *character);
-/// The contacts the last move found. Returns the count written (capped at capacity).
+/// The contacts the last move found. Writes up to capacity of them and
+/// returns the TOTAL count, so a caller can grow its buffer and ask again.
 uint32_t ujolt_character_contacts(const ujolt_character *character, ujolt_character_contact *out, uint32_t capacity);
 /// The inner body, or UJOLT_INVALID_BODY when the character has none.
 ujolt_body_id ujolt_character_inner_body(const ujolt_character *character);

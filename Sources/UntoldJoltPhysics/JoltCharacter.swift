@@ -34,20 +34,29 @@ public struct JoltCharacterDescriptor: Sendable {
     public var layer: UInt32 = 0
     /// Reported by contacts with, and ray hits on, the character's inner body.
     public var entity: EntityID = JoltPhysicsBackend.environmentEntity
-    /// Presses down on what the character stands on (with a non-zero gravity).
+    /// Presses down on what the character stands on (with a non-zero
+    /// gravity); 0 never does.
     public var mass: Float = 70
-    /// The most force, in newtons, a pushed dynamic body receives.
+    /// The most force, in newtons, a pushed dynamic body receives; 0 never
+    /// pushes.
     public var maxStrength: Float = 100
-    /// The distance kept from every surface: the character stops this far short.
+    /// The distance kept from every surface: the character stops this far
+    /// short. Must be positive (0 or less falls back to 2 cm).
     public var padding: Float = 0.02
+    /// Must be positive (0 or less falls back to 10 cm; at 0 the character
+    /// would stick).
     public var predictiveContactDistance: Float = 0.1
-    /// Contacts steeper than this, in radians from the vertical, are walls.
+    /// Contacts steeper than this, in radians from the vertical, are walls;
+    /// 0 makes every contact a wall.
     public var maxSlopeAngle: Float = 50 * .pi / 180
+    /// The fraction of a penetration resolved per move (0 or less falls
+    /// back to 1).
     public var penetrationRecoverySpeed: Float = 1
     /// A kinematic body inside the shape: dynamic bodies bounce off the
     /// character and rays hit it. It carries `entity`, is never read back
     /// and goes away with the character.
     public var innerBody = true
+    /// Must be positive (0 or less falls back to 0.9).
     public var innerBodyFraction: Float = 0.9
     /// Whether dynamic bodies may shove the character. Off, a ball resting
     /// against it or hitting it never moves it, while the character still
@@ -72,7 +81,8 @@ public enum JoltCharacterGroundState: Sendable {
     case inAir
 }
 
-/// A contact the character's last move found.
+/// A contact the character's last move found. Trigger volumes are never
+/// listed: the character passes through them.
 public struct JoltCharacterContact: Sendable {
     /// The other body's entity; `JoltPhysicsBackend.environmentEntity` for
     /// environment geometry.
@@ -116,7 +126,9 @@ public final class JoltCharacter: @unchecked Sendable {
         return SIMD3<Float>(out.0, out.1, out.2)
     }
 
-    /// The velocity the last move ended with (after sliding).
+    /// The velocity the last move actually produced — its displacement over
+    /// its `deltaTime`, after sliding and stopping — not the one asked for.
+    /// Zero before any move.
     public var velocity: SIMD3<Float> {
         guard let handle else { return .zero }
         var out: (Float, Float, Float) = (0, 0, 0)
@@ -179,13 +191,21 @@ public final class JoltCharacter: @unchecked Sendable {
         }
     }
 
-    /// The contacts the last move found (touching, penetrating and predicted).
+    /// The contacts the last move found (touching, penetrating and predicted;
+    /// never trigger volumes).
     public func contacts() -> [JoltCharacterContact] {
         guard let handle else { return [] }
-        let count = contactScratch.withUnsafeMutableBufferPointer { buffer in
+        var count = contactScratch.withUnsafeMutableBufferPointer { buffer in
             Int(ujolt_character_contacts(handle, buffer.baseAddress, UInt32(buffer.count)))
         }
-        return (0 ..< count).map { index in
+        if count > contactScratch.count {
+            // More than the scratch holds: grow it and ask again.
+            contactScratch = Array(repeating: ujolt_character_contact(), count: count)
+            count = contactScratch.withUnsafeMutableBufferPointer { buffer in
+                Int(ujolt_character_contacts(handle, buffer.baseAddress, UInt32(buffer.count)))
+            }
+        }
+        return (0 ..< min(count, contactScratch.count)).map { index in
             let c = contactScratch[index]
             return JoltCharacterContact(
                 entity: EntityID(c.user_data),
