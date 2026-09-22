@@ -342,6 +342,10 @@ typedef struct ujolt_ragdoll_desc {
     float angular_damping;          /* <= 0 -> Jolt's default (0.05) */
     float max_linear_velocity;      /* m/s; <= 0 -> 50 */
     int32_t start_active;           /* 0/1: whether the parts are in the world at creation */
+    const int32_t *disabled_pairs;  /* pairs of part indices (a0 b0 a1 b1 ...) that never collide with each other, on top of
+                                       every parent/child pair and every pair overlapping in the neutral pose; NULL for none.
+                                       A torso resting on its own thighs props a fallen body up: disable those pairs */
+    uint32_t disabled_pair_count;
 } ujolt_ragdoll_desc;
 
 /// NULL for a bad description: no parts, a parent index not before its
@@ -371,6 +375,11 @@ void ujolt_ragdoll_drive_motors(ujolt_ragdoll *ragdoll, const float *world_matri
 /// it is until it is given a pose).
 void ujolt_ragdoll_set_part_dynamic(ujolt_ragdoll *ragdoll, int32_t part, int32_t dynamic);
 int32_t ujolt_ragdoll_part_is_dynamic(const ujolt_ragdoll *ragdoll, int32_t part);
+/** Whether Jolt may put the parts to sleep when they come to rest (its default). A body settling through a slow
+    topple can pause below the sleep threshold long enough to be frozen mid-fall; forbid sleeping until it lies. */
+void ujolt_ragdoll_set_allow_sleeping(ujolt_ragdoll *ragdoll, int32_t allow);
+/** 1 while Jolt simulates the part (awake), 0 once it sleeps or the ragdoll is out of the world. */
+int32_t ujolt_ragdoll_part_is_awake(const ujolt_ragdoll *ragdoll, int32_t part);
 /// part -1 = all (the root has no constraint and is skipped); values <= 0
 /// keep the part's current setting.
 void ujolt_ragdoll_set_motors(ujolt_ragdoll *ragdoll, int32_t part, ujolt_motor_mode mode, float frequency, float damping, float max_torque, float friction_torque);

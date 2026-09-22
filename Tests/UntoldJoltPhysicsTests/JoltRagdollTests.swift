@@ -491,4 +491,49 @@ final class JoltRagdollTests: XCTestCase {
         XCTAssertLessThan(extended, 6, "and not beyond straight the other way: \(extended)°")
         XCTAssertGreaterThan(extended, -6, "nor anywhere near the free pendulum's 60°: \(extended)°")
     }
+
+    func testSleepingCanBeForbiddenWhileABodySettles() {
+        func awakeAfterRest(allowSleeping: Bool) -> Bool {
+            let backend = makeBackend()
+            let ragdoll = makeChain(backend)
+            // The chain laid flat on the floor, at rest.
+            let flat = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(0, 0, 1))
+            ragdoll.setPose(heights.map { transform(SIMD3<Float>($0 - 1.0, 0.1, 0), flat) }, resetVelocities: true)
+            ragdoll.setPartDynamic(nil, true)
+            ragdoll.setMotors(nil, mode: .off)
+            ragdoll.setAllowSleeping(allowSleeping)
+            advance(backend, seconds: 3)
+            return ragdoll.isPartAwake(0)
+        }
+        XCTAssertFalse(awakeAfterRest(allowSleeping: true), "Jolt sleeps a body at rest")
+        XCTAssertTrue(awakeAfterRest(allowSleeping: false), "unless told not to")
+    }
+
+    func testDisabledPairsLetPartsPassThroughEachOther() {
+        // The lower part folded back onto the pelvis: with the pair
+        // disabled the capsules overlap freely; otherwise they push apart.
+        func overlapAfterFold(disable: Bool) -> Float {
+            let backend = makeBackend()
+            var descriptor = chain()
+            descriptor.startActive = true
+            for index in descriptor.parts.indices {
+                descriptor.parts[index].normalHalfConeAngle = .pi
+                descriptor.parts[index].planeHalfConeAngle = .pi
+            }
+            if disable { descriptor.disabledCollisionPairs = [(0, 2)] }
+            let ragdoll = backend.addRagdoll(descriptor)!
+            // Pelvis fixed (kinematic); upper folded down -Y so the lower
+            // part's capsule lands inside the pelvis capsule.
+            let down = simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 0, 1))
+            ragdoll.setKinematicPose([transform(SIMD3<Float>(0, 1.0, 0)), transform(SIMD3<Float>(0, 1.3, 0), down), transform(SIMD3<Float>(0, 1.0, 0), down)])
+            ragdoll.setPartDynamic(2, true)
+            ragdoll.setMotors(nil, mode: .off)
+            advance(backend, seconds: 1)
+            let pelvis = positions(ragdoll)[0], lower = positions(ragdoll)[2]
+            return simd_distance(pelvis, lower)
+        }
+        let apart = overlapAfterFold(disable: false)
+        let through = overlapAfterFold(disable: true)
+        XCTAssertGreaterThan(apart, through + 0.03, "collision pushes the folded part out (\(apart) vs \(through))")
+    }
 }

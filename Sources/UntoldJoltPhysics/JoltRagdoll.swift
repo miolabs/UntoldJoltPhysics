@@ -104,6 +104,11 @@ public struct JoltRagdollDescriptor: Sendable {
     /// Whether the parts are in the world from creation; otherwise
     /// `JoltRagdoll.setActive(true)` puts them there.
     public var startActive = false
+    /// Pairs of part indices that never collide with each other, on top of
+    /// every parent/child pair and every pair overlapping in the neutral
+    /// pose. A torso resting on its own thighs props a fallen body up:
+    /// disable those pairs.
+    public var disabledCollisionPairs: [(Int, Int)] = []
 
     public init(parts: [JoltRagdollPart]) {
         self.parts = parts
@@ -203,6 +208,22 @@ public final class JoltRagdoll: @unchecked Sendable {
     public func setPartDynamic(_ index: Int?, _ dynamic: Bool) {
         guard let handle else { return }
         ujolt_ragdoll_set_part_dynamic(handle, index.map { Int32($0) } ?? -1, dynamic ? 1 : 0)
+    }
+
+    /// Whether Jolt may put the parts to sleep when they come to rest (its
+    /// default). A body settling through a slow topple can pause below the
+    /// sleep threshold long enough to be frozen mid-fall: forbid sleeping
+    /// until it lies.
+    public func setAllowSleeping(_ allow: Bool) {
+        guard let handle else { return }
+        ujolt_ragdoll_set_allow_sleeping(handle, allow ? 1 : 0)
+    }
+
+    /// True while Jolt simulates the part; false once it sleeps or the
+    /// parts are out of the world.
+    public func isPartAwake(_ index: Int) -> Bool {
+        guard let handle else { return false }
+        return ujolt_ragdoll_part_is_awake(handle, Int32(index)) != 0
     }
 
     public func isPartDynamic(_ index: Int) -> Bool {
@@ -362,9 +383,14 @@ extension JoltPhysicsBackend {
         desc.angular_damping = descriptor.angularDamping
         desc.max_linear_velocity = descriptor.maxLinearVelocity
         desc.start_active = descriptor.startActive ? 1 : 0
-        let handle: OpaquePointer? = parts.withUnsafeBufferPointer { buffer in
+        let flatPairs = descriptor.disabledCollisionPairs.flatMap { [Int32($0.0), Int32($0.1)] }
+        let handle: OpaquePointer? = flatPairs.withUnsafeBufferPointer { pairBuffer in
+            desc.disabled_pairs = pairBuffer.baseAddress
+            desc.disabled_pair_count = UInt32(descriptor.disabledCollisionPairs.count)
+            return parts.withUnsafeBufferPointer { buffer in
             desc.parts = buffer.baseAddress
             return ujolt_world_add_ragdoll(worldHandle, &desc)
+            }
         }
         guard let handle else { return nil }
         return JoltRagdoll(handle: handle, descriptor: descriptor)

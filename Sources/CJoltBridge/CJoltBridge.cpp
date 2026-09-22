@@ -35,6 +35,7 @@
 #include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/PhysicsSettings.h>
 #include <Jolt/Physics/Ragdoll/Ragdoll.h>
+#include <Jolt/Physics/Collision/GroupFilterTable.h>
 #include <Jolt/Physics/SoftBody/SoftBodyCreationSettings.h>
 #include <Jolt/Physics/SoftBody/SoftBodyMotionProperties.h>
 #include <Jolt/Physics/SoftBody/SoftBodySharedSettings.h>
@@ -1280,6 +1281,18 @@ ujolt_ragdoll *ujolt_world_add_ragdoll(ujolt_world *world, const ujolt_ragdoll_d
     // overlapping-at-rest) pairs, then solve the root's joints first.
     if (!settings->Stabilize()) return nullptr;
     settings->DisableParentChildCollisions(neutral.data(), 0.0f);
+    if (desc->disabled_pairs != nullptr && desc->disabled_pair_count > 0) {
+        // DisableParentChildCollisions gave every part the same table.
+        // The settings own the table they just built; it is not shared yet.
+        auto *table = const_cast<GroupFilterTable *>(static_cast<const GroupFilterTable *>(settings->mParts[0].mCollisionGroup.GetGroupFilter()));
+        if (table != nullptr) {
+            for (uint32_t k = 0; k < desc->disabled_pair_count; ++k) {
+                const int32_t a = desc->disabled_pairs[2 * k], b = desc->disabled_pairs[2 * k + 1];
+                if (a < 0 || b < 0 || uint32_t(a) >= count || uint32_t(b) >= count || a == b) continue;
+                table->DisableCollision(CollisionGroup::SubGroupID(a), CollisionGroup::SubGroupID(b));
+            }
+        }
+    }
     settings->CalculateBodyIndexToConstraintIndex();
     settings->CalculateConstraintPriorities();
 
@@ -1418,6 +1431,21 @@ void ujolt_ragdoll_set_part_dynamic(ujolt_ragdoll *ragdoll, int32_t part, int32_
         auto record = ragdoll->world->records.find(ragdoll->parts[i]);
         if (record != ragdoll->world->records.end()) record->second.motion = motion;
     }
+}
+
+void ujolt_ragdoll_set_allow_sleeping(ujolt_ragdoll *ragdoll, int32_t allow) {
+    const BodyLockInterface &lockInterface = ragdoll->world->system.GetBodyLockInterface();
+    for (ujolt_body_id id : ragdoll->parts) {
+        BodyLockWrite lock(lockInterface, BodyID(id));
+        if (lock.Succeeded()) lock.GetBody().SetAllowSleeping(allow != 0);
+    }
+    // A part already asleep stays asleep until woken.
+    if (allow == 0 && ragdoll->active) ragdoll->ragdoll->Activate();
+}
+
+int32_t ujolt_ragdoll_part_is_awake(const ujolt_ragdoll *ragdoll, int32_t part) {
+    if (part < 0 || size_t(part) >= ragdoll->parts.size() || !ragdoll->active) return 0;
+    return ragdoll->world->system.GetBodyInterface().IsActive(BodyID(ragdoll->parts[size_t(part)])) ? 1 : 0;
 }
 
 int32_t ujolt_ragdoll_part_is_dynamic(const ujolt_ragdoll *ragdoll, int32_t part) {
