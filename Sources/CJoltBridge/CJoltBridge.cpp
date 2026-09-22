@@ -1272,6 +1272,8 @@ ujolt_ragdoll *ujolt_world_add_ragdoll(ujolt_world *world, const ujolt_ragdoll_d
                                       orDefault(p.motor_damping, 2.0f), FLT_MAX, orDefault(p.max_torque, 500.0f));
             joint->mSwingMotorSettings = motor;
             joint->mTwistMotorSettings = motor;
+            joint->mNumVelocityStepsOverride = desc->velocity_steps;
+            joint->mNumPositionStepsOverride = desc->position_steps;
             part.mToParent = joint;
         }
     }

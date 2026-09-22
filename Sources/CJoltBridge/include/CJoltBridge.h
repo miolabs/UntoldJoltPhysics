@@ -342,6 +342,10 @@ typedef struct ujolt_ragdoll_desc {
     float angular_damping;          /* <= 0 -> Jolt's default (0.05) */
     float max_linear_velocity;      /* m/s; <= 0 -> 50 */
     int32_t start_active;           /* 0/1: whether the parts are in the world at creation */
+    uint32_t velocity_steps;        /* solver iterations for the joints, per step; 0 -> the world's (Jolt: 10 / 2). A long
+                                       powered chain converges slowly: its outer links trail the animation until the joints
+                                       get more iterations than the world's default */
+    uint32_t position_steps;
     const int32_t *disabled_pairs;  /* pairs of part indices (a0 b0 a1 b1 ...) that never collide with each other, on top of
                                        every parent/child pair and every pair overlapping in the neutral pose; NULL for none.
                                        A torso resting on its own thighs props a fallen body up: disable those pairs */

@@ -109,6 +109,11 @@ public struct JoltRagdollDescriptor: Sendable {
     /// pose. A torso resting on its own thighs props a fallen body up:
     /// disable those pairs.
     public var disabledCollisionPairs: [(Int, Int)] = []
+    /// Solver iterations for the joints, per step; 0 = the world's (Jolt's
+    /// 10 velocity, 2 position). A long powered chain converges slowly:
+    /// its outer links trail the animation until the joints get more.
+    public var solverVelocitySteps = 0
+    public var solverPositionSteps = 0
 
     public init(parts: [JoltRagdollPart]) {
         self.parts = parts
@@ -410,6 +415,8 @@ extension JoltPhysicsBackend {
         desc.angular_damping = descriptor.angularDamping
         desc.max_linear_velocity = descriptor.maxLinearVelocity
         desc.start_active = descriptor.startActive ? 1 : 0
+        desc.velocity_steps = UInt32(max(descriptor.solverVelocitySteps, 0))
+        desc.position_steps = UInt32(max(descriptor.solverPositionSteps, 0))
         let flatPairs = descriptor.disabledCollisionPairs.flatMap { [Int32($0.0), Int32($0.1)] }
         let handle: OpaquePointer? = flatPairs.withUnsafeBufferPointer { pairBuffer in
             desc.disabled_pairs = pairBuffer.baseAddress
