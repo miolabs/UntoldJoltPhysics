@@ -588,4 +588,48 @@ final class JoltRagdollTests: XCTestCase {
         XCTAssertGreaterThan(tip.z, 0.05, "the dynamic part swings along +Z: \(tip.z)")
         XCTAssertEqual(pose[1].columns.3.z, 0, accuracy: 1e-3, "the kinematic part stays where its pose puts it")
     }
+
+    /// How far a powered chain trails a target that swings like an arm at a
+    /// run: the lower part's target rotates ±45° about Z at 1.5 Hz. Printed
+    /// for tuning; asserted loosely, and sub-steps must help.
+    func testTrackingLagBehindASwingingTarget() {
+        func lag(frequency: Float, torque: Float, substeps: Int32) -> Float {
+            var settings = JoltWorldSettings()
+            settings.workerThreads = 0
+            settings.collisionSteps = substeps
+            let backend = JoltPhysicsBackend(settings: settings)
+            backend.configure(PhysicsWorldConfiguration())
+            var descriptor = chain()
+            descriptor.startActive = true
+            let ragdoll = backend.addRagdoll(descriptor)!
+            ragdoll.setPartDynamic(1, true)
+            ragdoll.setPartDynamic(2, true)
+            ragdoll.setMotors(nil, mode: .position, frequency: frequency, damping: 1, maxTorque: torque)
+            var worst: Float = 0
+            var t: Float = 0
+            for frame in 0 ..< 180 {
+                t += step
+                let angle = 45 * Float.pi / 180 * sin(2 * .pi * 1.5 * t)
+                let q = simd_quatf(angle: angle, axis: SIMD3<Float>(0, 0, 1))
+                let upperPivot = SIMD3<Float>(0, 1.3, 0)
+                let lowerPivot = upperPivot + q.act(SIMD3<Float>(0, 0.3, 0))
+                let target = [transform(SIMD3<Float>(0, 1.0, 0)), transform(upperPivot, q), transform(lowerPivot, q)]
+                ragdoll.driveMotors(toward: target)
+                backend.step(deltaTime: step)
+                if frame > 60 {
+                    var pose: [simd_float4x4] = []
+                    ragdoll.readPose(into: &pose)
+                    let tip = pose[2] * SIMD4<Float>(0, 0.3, 0, 1)
+                    let wantTip = target[2] * SIMD4<Float>(0, 0.3, 0, 1)
+                    worst = max(worst, simd_distance(SIMD3<Float>(tip.x, tip.y, tip.z), SIMD3<Float>(wantTip.x, wantTip.y, wantTip.z)))
+                }
+            }
+            return worst
+        }
+        for (frequency, torque, substeps) in [(Float(20), Float(500), Int32(1)), (30, 2000, 1), (60, 2000, 3), (90, 2000, 4), (60, 500, 3)] {
+            print(String(format: "tracking lag: %.0f Hz, %.0f N m, %d substeps -> tip error %.3f m", frequency, torque, substeps, lag(frequency: frequency, torque: torque, substeps: substeps)))
+        }
+        XCTAssertLessThan(lag(frequency: 20, torque: 2000, substeps: 1), 0.3)
+        XCTAssertLessThan(lag(frequency: 60, torque: 2000, substeps: 3), lag(frequency: 20, torque: 2000, substeps: 1) / 2, "sub-steps let the motors run stiffer and halve the lag")
+    }
 }

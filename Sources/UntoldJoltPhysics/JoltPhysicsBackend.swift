@@ -40,6 +40,11 @@ public struct JoltWorldSettings: Sendable {
     /// Dynamic bodies use Jolt's continuous collision (LinearCast), so a fast
     /// body cannot pass through thin geometry. Costs a little per body.
     public var continuousCollision = true
+    /// Jolt sub-steps per engine step (its `collision steps`): the world is
+    /// integrated this many times per step at dt / n. More lets joint
+    /// motors run stiffer than half the engine's step rate allows — a
+    /// powered ragdoll tracking a fast animation wants three.
+    public var collisionSteps: Int32 = 1
     /// Non-trigger contacts closing slower than this (m/s) are not reported
     /// as `.began`: a resting contact re-established after a sleep or a
     /// geometry rebuild is not an impact. Keep it above one substep of
@@ -85,6 +90,7 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
     public static let environmentEntity: EntityID = .invalid
 
     private let world: OpaquePointer
+    private let collisionSteps: Int32
     /// The bridge world, for the module's extensions (soft bodies, characters).
     var worldHandle: OpaquePointer { world }
     private let settings: JoltWorldSettings
@@ -102,6 +108,7 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
     private var activationScratch: [ujolt_activation_event]
 
     public init(settings: JoltWorldSettings = JoltWorldSettings()) {
+        collisionSteps = max(settings.collisionSteps, 1)
         self.settings = settings
         var desc = ujolt_world_desc()
         desc.max_bodies = settings.maxBodies
@@ -246,7 +253,7 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
 
     public func step(deltaTime: Float) {
         applyPendingEnvironment()
-        ujolt_world_step(world, deltaTime, 1)
+        ujolt_world_step(world, deltaTime, collisionSteps)
     }
 
     public func readActiveTransforms(into batch: PhysicsTransformReadBatch) -> Int {
