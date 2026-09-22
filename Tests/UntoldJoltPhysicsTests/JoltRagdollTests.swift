@@ -1,0 +1,361 @@
+//
+//  JoltRagdollTests.swift
+//  UntoldJoltPhysics
+//
+
+import simd
+import UntoldEngine
+@testable import UntoldJoltPhysics
+import XCTest
+
+private final class RecordingSink: PhysicsEventSink {
+    var contacts: [PhysicsContactEvent] = []
+    var triggers: [PhysicsTriggerEvent] = []
+    var activations: [PhysicsBodyActivationEvent] = []
+    var dropped = 0
+
+    func receiveContact(_ event: PhysicsContactEvent) { contacts.append(event) }
+    func receiveTrigger(_ event: PhysicsTriggerEvent) { triggers.append(event) }
+    func receiveActivation(_ event: PhysicsBodyActivationEvent) { activations.append(event) }
+    func reportDroppedEvents(count: Int) { dropped += count }
+}
+
+final class JoltRagdollTests: XCTestCase {
+    private let step: Float = 1.0 / 60.0
+    private let zombie: EntityID = 42
+    private let identity = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    /// The chain's capsule radii and neutral pivot heights, root first.
+    private let radii: [Float] = [0.1, 0.06, 0.05]
+    private let heights: [Float] = [1.0, 1.3, 1.6]
+
+    /// A world with a static floor whose top is y = 0.
+    private func makeBackend() -> JoltPhysicsBackend {
+        var settings = JoltWorldSettings()
+        settings.workerThreads = 0
+        let backend = JoltPhysicsBackend(settings: settings)
+        backend.configure(PhysicsWorldConfiguration())
+        backend.didAddBody(entity: 1000, descriptor: PhysicsBodyDescriptor(
+            motionType: .static,
+            collider: PhysicsColliderDescriptor(shape: .box(halfExtents: simd_float3(50, 0.5, 50)), friction: 0.5, restitution: 0.0),
+            position: simd_float3(0, -0.5, 0)
+        ))
+        return backend
+    }
+
+    /// The chain of the tests: a pelvis at 1 m with an upper and a lower
+    /// part stacked above it, each a capsule along +Y whose base is at the
+    /// joint pivot (so the shape sits 15 cm up the part's frame); cones of
+    /// 60°, twist ±30°.
+    private func chain(masses: [Float] = [10, 3, 2]) -> JoltRagdollDescriptor {
+        let names = ["pelvis", "upper", "lower"]
+        let shapes: [PhysicsColliderShape] = [
+            .capsule(radius: 0.1, height: 0.2),
+            .capsule(radius: 0.06, height: 0.3),
+            .capsule(radius: 0.05, height: 0.3),
+        ]
+        var parts: [JoltRagdollPart] = []
+        for index in 0 ..< 3 {
+            var part = JoltRagdollPart(
+                name: names[index],
+                parentIndex: index == 0 ? nil : index - 1,
+                shape: shapes[index],
+                mass: masses[index],
+                position: SIMD3<Float>(0, heights[index], 0),
+                rotation: identity,
+                twistAxis: SIMD3<Float>(0, 1, 0),
+                planeAxis: SIMD3<Float>(1, 0, 0)
+            )
+            part.shapeOffset = SIMD3<Float>(0, 0.15, 0)
+            part.twistRange = (-30 * Float.pi / 180) ... (30 * Float.pi / 180)
+            part.normalHalfConeAngle = 60 * .pi / 180
+            part.planeHalfConeAngle = 60 * .pi / 180
+            parts.append(part)
+        }
+        var descriptor = JoltRagdollDescriptor(parts: parts)
+        descriptor.entity = zombie
+        return descriptor
+    }
+
+    private func makeChain(_ backend: JoltPhysicsBackend, active: Bool = true) -> JoltRagdoll {
+        var descriptor = chain()
+        descriptor.startActive = active
+        let ragdoll = backend.addRagdoll(descriptor)
+        XCTAssertNotNil(ragdoll)
+        return ragdoll!
+    }
+
+    private func transform(_ position: SIMD3<Float>, _ rotation: simd_quatf? = nil) -> simd_float4x4 {
+        var m = simd_float4x4(rotation ?? identity)
+        m.columns.3 = SIMD4<Float>(position, 1)
+        return m
+    }
+
+    private func neutralPose() -> [simd_float4x4] {
+        heights.map { transform(SIMD3<Float>(0, $0, 0)) }
+    }
+
+    /// The chain with the upper and lower parts leaning 20° about Z (the
+    /// pelvis stays): the lower's pivot rides on the upper's tilted axis.
+    private func leaningPose() -> [simd_float4x4] {
+        let lean = simd_quatf(angle: 20 * .pi / 180, axis: SIMD3<Float>(0, 0, 1))
+        let upperPivot = SIMD3<Float>(0, 1.3, 0)
+        let lowerPivot = upperPivot + lean.act(SIMD3<Float>(0, 0.3, 0))
+        return [transform(SIMD3<Float>(0, 1.0, 0)), transform(upperPivot, lean), transform(lowerPivot, lean)]
+    }
+
+    private func positions(_ ragdoll: JoltRagdoll) -> [SIMD3<Float>] {
+        var pose: [simd_float4x4] = []
+        ragdoll.readPose(into: &pose)
+        return pose.map { SIMD3<Float>($0.columns.3.x, $0.columns.3.y, $0.columns.3.z) }
+    }
+
+    /// Steps the world for `seconds`, calling `eachFrame` before every step
+    /// the way a game frame does.
+    private func advance(_ backend: JoltPhysicsBackend, seconds: Float, sink: RecordingSink? = nil, eachFrame: (() -> Void)? = nil) {
+        for _ in 0 ..< Int((seconds / step).rounded()) {
+            eachFrame?()
+            backend.step(deltaTime: step)
+            if let sink { backend.drainEvents(into: sink) }
+        }
+    }
+
+    private func readTransforms(_ backend: JoltPhysicsBackend, capacity: Int = 64) -> [EntityID: PhysicsBodyTransform] {
+        var entities = [EntityID](repeating: 0, count: capacity)
+        var transforms = [PhysicsBodyTransform](
+            repeating: PhysicsBodyTransform(position: .zero, orientation: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)),
+            count: capacity
+        )
+        var result: [EntityID: PhysicsBodyTransform] = [:]
+        entities.withUnsafeMutableBufferPointer { entityBuffer in
+            transforms.withUnsafeMutableBufferPointer { transformBuffer in
+                let batch = PhysicsTransformReadBatch(entities: entityBuffer, transforms: transformBuffer)
+                let written = backend.readActiveTransforms(into: batch)
+                for index in 0 ..< written {
+                    result[entityBuffer[index]] = transformBuffer[index]
+                }
+            }
+        }
+        return result
+    }
+
+    // MARK: - Tests
+
+    func testCreationActivationAndRemoval() {
+        let backend = makeBackend()
+        let before = backend.bodyCount
+        let ragdoll = makeChain(backend, active: false)
+        XCTAssertEqual(ragdoll.partCount, 3)
+        XCTAssertEqual(ragdoll.partNames, ["pelvis", "upper", "lower"])
+        XCTAssertEqual(ragdoll.parentIndices, [nil, 0, 1])
+        XCTAssertEqual(ragdoll.entity, zombie)
+        XCTAssertEqual(backend.bodyCount, before + 3, "every part is listed, in the world or not")
+        XCTAssertFalse(ragdoll.isActive)
+        XCTAssertFalse(ragdoll.isPartDynamic(0), "parts start kinematic")
+
+        let neutral = positions(ragdoll)
+        XCTAssertEqual(neutral.count, 3)
+        XCTAssertEqual(neutral[2].y, 1.6, accuracy: 1e-5)
+        ragdoll.setActive(true)
+        XCTAssertTrue(ragdoll.isActive)
+        XCTAssertEqual(backend.bodyCount, before + 3)
+        ragdoll.setActive(true) // twice is harmless
+        advance(backend, seconds: 0.2)
+        XCTAssertEqual(positions(ragdoll)[2].y, 1.6, accuracy: 1e-4, "kinematic parts given no pose stay put")
+
+        backend.removeRagdoll(ragdoll)
+        XCTAssertFalse(ragdoll.isValid)
+        XCTAssertFalse(ragdoll.isActive)
+        XCTAssertEqual(backend.bodyCount, before)
+        var pose: [simd_float4x4] = []
+        XCTAssertEqual(ragdoll.readPose(into: &pose), 0)
+        backend.removeRagdoll(ragdoll) // twice is harmless
+        advance(backend, seconds: 0.1)
+
+        // Malformed descriptions are refused.
+        var reversed = chain()
+        reversed.parts[1].parentIndex = 2
+        XCTAssertNil(backend.addRagdoll(reversed), "a parent must come before its child")
+        var twoRoots = chain()
+        twoRoots.parts[1].parentIndex = nil
+        XCTAssertNil(backend.addRagdoll(twoRoots))
+        var hull = chain()
+        hull.parts[2].shape = .convexHull(vertices: [.zero, SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0), SIMD3<Float>(0, 0, 1)])
+        XCTAssertNil(backend.addRagdoll(hull))
+        XCTAssertNil(backend.addRagdoll(JoltRagdollDescriptor(parts: [])))
+        XCTAssertEqual(backend.bodyCount, before, "a refused ragdoll leaves nothing behind")
+    }
+
+    func testKinematicPartsFollowTheKinematicPose() {
+        let backend = makeBackend()
+        let ragdoll = makeChain(backend)
+        let moved = neutralPose().map { transform(SIMD3<Float>(0.5, $0.columns.3.y, 0)) }
+        advance(backend, seconds: 1) {
+            ragdoll.setKinematicPose(moved)
+        }
+        let after = positions(ragdoll)
+        for index in 0 ..< 3 {
+            XCTAssertEqual(after[index].x, 0.5, accuracy: 1e-3, "part \(index) followed the pose")
+            XCTAssertEqual(after[index].y, heights[index], accuracy: 1e-3)
+        }
+        // The pose is kept: further steps without a new one hold it.
+        advance(backend, seconds: 0.2)
+        XCTAssertEqual(positions(ragdoll)[0].x, 0.5, accuracy: 1e-3)
+        XCTAssertNil(readTransforms(backend)[zombie], "ragdoll parts are never read back")
+    }
+
+    func testMotorsHoldTheChainAgainstGravity() {
+        let backend = makeBackend()
+        let ragdoll = makeChain(backend)
+        ragdoll.setPartDynamic(1, true)
+        ragdoll.setPartDynamic(2, true)
+        XCTAssertFalse(ragdoll.isPartDynamic(0))
+        XCTAssertTrue(ragdoll.isPartDynamic(1))
+        XCTAssertTrue(ragdoll.isPartDynamic(2))
+        ragdoll.setMotors(nil, mode: .position)
+        // Start leaning, so the motors have to pull the chain back up and
+        // then hold it there (a perfectly vertical chain is balanced and
+        // would prove nothing).
+        ragdoll.setPose(leaningPose())
+        XCTAssertGreaterThan(simd_length(positions(ragdoll)[2] - SIMD3<Float>(0, 1.6, 0)), 0.09)
+
+        let neutral = neutralPose()
+        var largestDriftAfterSettling: Float = 0
+        var frame = 0
+        advance(backend, seconds: 2) {
+            ragdoll.driveMotors(toward: neutral)
+            frame += 1
+            if frame > 60 {
+                largestDriftAfterSettling = max(largestDriftAfterSettling, simd_length(self.positions(ragdoll)[2] - SIMD3<Float>(0, 1.6, 0)))
+            }
+        }
+        let lower = positions(ragdoll)[2]
+        XCTAssertEqual(simd_length(lower - SIMD3<Float>(0, 1.6, 0)), 0, accuracy: 0.05, "the motors hold the lower part at neutral")
+        XCTAssertLessThan(largestDriftAfterSettling, 0.05, "and keep it there through the second second")
+    }
+
+    func testLimpChainFoldsUnderFrictionWithoutSinking() {
+        let backend = makeBackend()
+        let ragdoll = makeChain(backend)
+        ragdoll.setPartDynamic(1, true)
+        ragdoll.setPartDynamic(2, true)
+        ragdoll.setMotors(nil, mode: .off, frictionTorque: 2)
+        ragdoll.setPose(leaningPose())
+        let lowerStart = positions(ragdoll)[2]
+
+        advance(backend, seconds: 2)
+        let after = positions(ragdoll)
+        XCTAssertLessThan(after[2].y, lowerStart.y - 0.08, "the chain folded over: the lower part came down")
+        XCTAssertEqual(after[0].y, 1.0, accuracy: 1e-4, "the kinematic pelvis did not move")
+        for index in 0 ..< 3 {
+            XCTAssertGreaterThanOrEqual(after[index].y, radii[index] - 0.01, "part \(index) is not below the floor")
+        }
+    }
+
+    func testKnockdownComesToRestOnTheFloor() {
+        let backend = makeBackend()
+        let ragdoll = makeChain(backend)
+        ragdoll.setPartDynamic(nil, true)
+        XCTAssertTrue((0 ..< 3).allSatisfy { ragdoll.isPartDynamic($0) })
+        // Lying along +X, half a metre up: each capsule's axis (its local
+        // Y) turned onto the world X axis.
+        let lying = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(0, 0, 1))
+        let pose = [
+            transform(SIMD3<Float>(0, 0.5, 0), lying),
+            transform(SIMD3<Float>(0.3, 0.5, 0), lying),
+            transform(SIMD3<Float>(0.6, 0.5, 0), lying),
+        ]
+        ragdoll.setPose(pose)
+        ragdoll.setVelocities(linear: Array(repeating: .zero, count: 3), angular: nil)
+
+        advance(backend, seconds: 2)
+        let resting = positions(ragdoll)
+        for index in 0 ..< 3 {
+            // A part lying flat rests with its origin one radius up, less
+            // Jolt's 2 cm penetration slop; one that hangs off the joint of
+            // a thicker neighbour rides a little higher, never lower.
+            XCTAssertGreaterThan(resting[index].y, radii[index] - 0.025, "part \(index) does not sink into the floor")
+            XCTAssertLessThan(resting[index].y, radii[0] + 0.03, "part \(index) is down on the floor")
+        }
+        advance(backend, seconds: 1)
+        let later = positions(ragdoll)
+        for index in 0 ..< 3 {
+            XCTAssertEqual(later[index].y, resting[index].y, accuracy: 0.01, "part \(index) stays where it rests")
+        }
+    }
+
+    func testContactsNameTheRagdollsEntityAndItIsNeverReadBack() {
+        let backend = makeBackend()
+        let ragdoll = makeChain(backend)
+        backend.didAddBody(entity: 7, descriptor: PhysicsBodyDescriptor(
+            motionType: .dynamic,
+            collider: PhysicsColliderDescriptor(shape: .sphere(radius: 0.11), friction: 0.35, restitution: 0.3),
+            mass: 0.43,
+            position: simd_float3(0, 2.4, 0)
+        ))
+        let sink = RecordingSink()
+        advance(backend, seconds: 1, sink: sink)
+        let hits = sink.contacts.filter { $0.phase == .began && ($0.entityA == zombie || $0.entityB == zombie) }
+        XCTAssertFalse(hits.isEmpty, "the ball landing on the chain names the ragdoll's entity")
+        XCTAssertEqual(hits.first?.entityA, 7, "A is the dynamic ball")
+        XCTAssertEqual(hits.first?.entityB, zombie)
+        XCTAssertNil(readTransforms(backend)[zombie])
+
+        // Simulated parts are active dynamic bodies, and still not read back.
+        ragdoll.setPartDynamic(nil, true)
+        var sawBall = false
+        advance(backend, seconds: 0.5) {
+            let read = self.readTransforms(backend)
+            XCTAssertNil(read[self.zombie])
+            sawBall = sawBall || read[7] != nil
+        }
+        XCTAssertTrue(sawBall, "the ball, an engine body, is read back as usual")
+    }
+
+    func testImpulseMovesADynamicPart() throws {
+        let backend = makeBackend()
+        // One free part (no joint pulls on it, and Jolt's mass balancing
+        // leaves a lone part alone): the impulse's whole momentum is its.
+        var single = chain()
+        single.parts.removeLast(2)
+        single.startActive = true
+        let lone = try XCTUnwrap(backend.addRagdoll(single))
+        lone.setPartDynamic(0, true)
+        lone.addImpulse(SIMD3<Float>(2, 0, 0), toPart: 0, at: SIMD3<Float>(0, 1.15, 0))
+        backend.step(deltaTime: step)
+        // 2 N s on 10 kg is 0.2 m/s: one step's travel, less Jolt's 5 %/s
+        // linear damping.
+        XCTAssertEqual(positions(lone)[0].x, 0.2 * step, accuracy: 0.0002)
+        XCTAssertEqual(positions(lone)[0].z, 0, accuracy: 1e-5)
+
+        // In the chain, a hit on the one dynamic part swings it about its
+        // pivot (which its joint pins, so the shape's centre is what moves);
+        // the same hit on a kinematic part does nothing.
+        let ragdoll = makeChain(backend)
+        ragdoll.setPartDynamic(2, true)
+        var pose: [simd_float4x4] = []
+        func centreX(_ part: Int) -> Float {
+            ragdoll.readPose(into: &pose)
+            return pose[part].columns.3.x + 0.15 * pose[part].columns.1.x
+        }
+        ragdoll.addImpulse(SIMD3<Float>(1, 0, 0), toPart: 1, at: SIMD3<Float>(0, 1.45, 0))
+        advance(backend, seconds: 0.1)
+        XCTAssertEqual(centreX(1), 0, accuracy: 1e-5, "a kinematic part ignores the impulse")
+        ragdoll.addImpulse(SIMD3<Float>(1, 0, 0), toPart: 2, at: SIMD3<Float>(0, 1.75, 0))
+        advance(backend, seconds: 0.1)
+        XCTAssertEqual(positions(ragdoll)[2].x, 0, accuracy: 1e-3, "the pivot stays on its kinematic parent")
+        XCTAssertGreaterThan(centreX(2), 0.01, "the dynamic part swung with the hit")
+    }
+
+    func testRagdollsDoNotOutliveTheWorld() {
+        // The world destructor must take the ragdoll out and destroy its
+        // parts before sweeping the bodies; a crash here is the failure.
+        let ragdoll: JoltRagdoll = {
+            let backend = makeBackend()
+            let ragdoll = makeChain(backend)
+            ragdoll.setPartDynamic(nil, true)
+            advance(backend, seconds: 0.2)
+            return ragdoll // the backend, and its world, die here
+        }()
+        XCTAssertTrue(ragdoll.isValid, "the handle is not told; the owner must not use it")
+    }
+}

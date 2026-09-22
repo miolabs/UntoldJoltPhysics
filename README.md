@@ -21,8 +21,8 @@ Follows the engine's [plugin authoring guidelines](https://github.com/untoldengi
 | Path | What it is |
 |---|---|
 | `Package.swift` | Depends on `JoltPhysics` from the fork at an exact tag (`5.6.0-spm.1` = Jolt v5.6.0). To update Jolt: branch the fork from the new upstream tag, keep its `Package.swift`, tag `<version>-spm.1`, bump the pin here. |
-| `Sources/CJoltBridge/` | C ABI shim over Jolt (`CJoltBridge.h`): opaque world handle, plain structs, explicit create/destroy — world, bodies, kinematic targets, step, transform read-back, buffered contact/activation events, ray cast. |
-| `Sources/UntoldJoltPhysics/` | The plugin: `JoltPhysicsBackend` (conforms to `PhysicsBackend`), `JoltPhysicsPlugin` (the manifest) and `registerJoltPhysics()`. |
+| `Sources/CJoltBridge/` | C ABI shim over Jolt (`CJoltBridge.h`): opaque world handle, plain structs, explicit create/destroy — world, bodies, kinematic targets, step, transform read-back, buffered contact/activation events, ray cast, plus the extras (soft bodies, a character controller, ragdolls). |
+| `Sources/UntoldJoltPhysics/` | The plugin: `JoltPhysicsBackend` (conforms to `PhysicsBackend`), `JoltPhysicsPlugin` (the manifest) and `registerJoltPhysics()`, with `JoltSoftBody`, `JoltCharacter` and `JoltRagdoll` as its side channels. |
 | `Tests/` | Backend tests driven through the engine protocol, plus manifest/registration tests. |
 
 ## Install
@@ -129,6 +129,29 @@ built against, as the engine's validator demands.
   shape) makes dynamic bodies bounce off the character and rays hit it; it
   carries the character's `entity`, is never read back and goes with the
   character. Every character call is frame-thread only, between steps.
+- **Ragdolls** (`JoltPhysicsBackend.addRagdoll` / `removeRagdoll`, then
+  `JoltRagdoll`): Jolt's `Ragdoll` over swing-twist joints with motors, built
+  from a `JoltRagdollDescriptor` — one rigid part per skeleton joint (capsule,
+  sphere or box), parents before children, each joined to its parent by a
+  cone/twist limit at its pivot. Poses are one world transform per part with
+  the body origin at the joint pivot, in and out (`setPose` teleports,
+  `readPose` reads back). Each part is kinematic (it follows the pose given
+  with `setKinematicPose`, which is re-applied every substep until replaced)
+  or dynamic (`setPartDynamic`: simulated, its joint motors when in position
+  mode pulling it toward the local rotations `driveMotors` derives from the
+  pose it is handed each frame). `setMotors` switches a joint's motors and
+  retunes their spring, torque limit and the friction torque that resists
+  the joint while they are off. So a knockdown is every part dynamic with
+  the motors off and some friction, the mesh following `readPose`; a hit
+  reaction is the hit subtree dynamic with motors driving it toward the live
+  animation while the rest stays kinematic; `addImpulse` delivers the hit.
+  Jolt stabilises the chain (parent/child mass ratios clamped to 0.8…1.2,
+  parent inertias raised) and never collides a part with its parent or with
+  a part it overlaps at rest. Every part reports the ragdoll's `entity` in
+  contacts and ray hits, none is ever read back through the engine's
+  transform batch, and `removeRagdoll` (or the world going away) takes them
+  all. `startActive` / `setActive` put the parts in the world or hold them
+  out; the parts keep their state either way. Frame thread, between steps.
 
 ## Tests
 
@@ -143,14 +166,20 @@ exclusions and layer masks, the layer matrix, capsule/cylinder/convex-hull
 shapes, collider offsets, gravity, and soft bodies (a hanging rope, a sheet
 catching a ball, removal). The character suite walks a controller into a wall
 and along it, over a low box, into a ball it pushes and a ball that bounces
-off it, hits it with a ray, teleports it and removes it. The plugin suite
-covers the manifest, install/uninstall, replacement and the registration
-helper.
+off it, hits it with a ray, teleports it and removes it. The ragdoll suite
+builds a three-part chain on the floor and checks creation, activation and
+removal, kinematic parts following a pose, motors holding a leaning chain up
+against gravity, a limp chain folding under joint friction without sinking,
+a knockdown coming to rest on the floor, contacts naming the ragdoll's
+entity while its parts are never read back, impulses on dynamic parts, and
+world teardown with a live ragdoll. The plugin suite covers the manifest,
+install/uninstall, replacement and the registration helper.
 
 ## Roadmap
 
 Staged as agreed with the engine maintainers: prototype (this) → collision
-events (done) → character controller (done) → mesh colliders.
+events (done) → character controller (done) → ragdolls (done) → mesh
+colliders.
 
 ## License
 

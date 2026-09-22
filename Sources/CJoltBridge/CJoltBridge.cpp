@@ -32,12 +32,15 @@
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/TransformedShape.h>
+#include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/PhysicsSettings.h>
+#include <Jolt/Physics/Ragdoll/Ragdoll.h>
 #include <Jolt/Physics/SoftBody/SoftBodyCreationSettings.h>
 #include <Jolt/Physics/SoftBody/SoftBodyMotionProperties.h>
 #include <Jolt/Physics/SoftBody/SoftBodySharedSettings.h>
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/RegisterTypes.h>
+#include <Jolt/Skeleton/Skeleton.h>
 
 #include <algorithm>
 #include <cfloat>
@@ -73,6 +76,20 @@ inline Quat q4(const float *p) {
 }
 inline void store3(float *out, Vec3Arg v) { out[0] = v.GetX(); out[1] = v.GetY(); out[2] = v.GetZ(); }
 inline void store4(float *out, QuatArg q) { out[0] = q.GetX(); out[1] = q.GetY(); out[2] = q.GetZ(); out[3] = q.GetW(); }
+/// 16 floats column-major (simd_float4x4 layout), which is Mat44's own.
+inline Mat44 mat44(const float *m) {
+    return Mat44(Vec4(m[0], m[1], m[2], m[3]), Vec4(m[4], m[5], m[6], m[7]),
+                 Vec4(m[8], m[9], m[10], m[11]), Vec4(m[12], m[13], m[14], m[15]));
+}
+inline void storeMat44(float *out, Mat44Arg m) {
+    for (uint c = 0; c < 4; ++c) {
+        const Vec4 column = m.GetColumn4(c);
+        out[c * 4] = column.GetX();
+        out[c * 4 + 1] = column.GetY();
+        out[c * 4 + 2] = column.GetZ();
+        out[c * 4 + 3] = column.GetW();
+    }
+}
 
 struct BodyRecord {
     uint64_t userData;
@@ -83,6 +100,10 @@ struct BodyRecord {
     /// removes and destroys it), listed here so contacts and rays resolve
     /// to the character's user data.
     bool inner = false;
+    /// A ragdoll part: owned by the ragdoll (whose Jolt object destroys it),
+    /// listed here for contacts and rays; never handed to the engine's
+    /// coordinator as a changed body.
+    bool ragdoll = false;
 };
 
 struct KinematicTarget {
@@ -139,6 +160,26 @@ struct ujolt_character final : public CharacterContactListener {
     }
 };
 
+/// A Jolt Ragdoll and what driving it needs. Owned by the world it was
+/// added to (released before the world's bodies on destruction): the Ragdoll
+/// destructor destroys its bodies, which must have been removed first.
+struct ujolt_ragdoll {
+    ujolt_world *world = nullptr;
+    Ref<Skeleton> skeleton;
+    Ref<RagdollSettings> settings;
+    Ref<Ragdoll> ragdoll;
+    std::vector<ujolt_body_id> parts;
+    /// Per part, the mode its constraint's motors were last set to (the
+    /// root has no constraint; its entry is never read).
+    std::vector<ujolt_motor_mode> motors;
+    /// The pose the kinematic parts are moved to every step while one is
+    /// set: the engine runs 0..5 substeps a frame, and re-driving each
+    /// substep is what a kinematic target does.
+    std::vector<Mat44> kinematicPose;
+    bool kinematicPending = false;
+    bool active = false;
+};
+
 struct ujolt_world final : public ContactListener, public BodyActivationListener {
     ujolt_world(const ujolt_world_desc &desc)
         : bpInterface(kObjectLayers, kBPLayers),
@@ -183,6 +224,10 @@ struct ujolt_world final : public ContactListener, public BodyActivationListener
         // below, and while the PhysicsSystem is still alive.
         for (ujolt_character *character : characters) releaseCharacter(character, false);
         characters.clear();
+        // Likewise the ragdolls: the Ragdoll destructor destroys the parts
+        // and wants them out of the system first.
+        for (ujolt_ragdoll *ragdoll : ragdolls) releaseRagdoll(ragdoll, false);
+        ragdolls.clear();
         BodyInterface &bi = system.GetBodyInterface();
         for (auto &entry : records) {
             BodyID id(entry.first);
@@ -254,6 +299,29 @@ struct ujolt_world final : public ContactListener, public BodyActivationListener
             }
         }
         delete character;
+    }
+
+    // MARK: Ragdolls (frame thread)
+
+    /// Takes the ragdoll out of the system if it is in, forgets its parts
+    /// (as tombstones when `keepTombstone`, so an in-flight OnContactRemoved
+    /// still resolves them) and deletes it, which drops the Ref whose last
+    /// holder destroys the bodies.
+    void releaseRagdoll(ujolt_ragdoll *ragdoll, bool keepTombstone) {
+        if (ragdoll->active) {
+            ragdoll->ragdoll->RemoveFromPhysicsSystem();
+            ragdoll->active = false;
+        }
+        {
+            std::lock_guard<std::mutex> guard(recordMutex);
+            for (ujolt_body_id part : ragdoll->parts) {
+                auto it = records.find(part);
+                if (it == records.end()) continue;
+                if (keepTombstone) removedRecords[part] = it->second;
+                records.erase(it);
+            }
+        }
+        delete ragdoll;
     }
 
     // MARK: ContactListener (Jolt worker threads)
@@ -384,6 +452,10 @@ struct ujolt_world final : public ContactListener, public BodyActivationListener
 
     std::vector<KinematicTarget> kinematicTargets;
     std::unordered_set<ujolt_character *> characters;
+    std::unordered_set<ujolt_ragdoll *> ragdolls;
+    /// Jolt's collision group per ragdoll (parent/child pairs are filtered
+    /// within a group): unique per ragdoll, so two never share one.
+    uint32_t nextRagdollGroup = 1;
 
     std::mutex eventMutex;
     std::unordered_set<uint64_t> reportedPairs;
@@ -396,33 +468,35 @@ struct ujolt_world final : public ContactListener, public BodyActivationListener
 
 namespace {
 
-RefConst<Shape> makeShape(const ujolt_body_desc &desc) {
+/// The bare shape at the body origin; the callers place it.
+RefConst<Shape> makePrimitiveShape(ujolt_shape_type kind, float radius, float halfHeight, const float *halfExtents,
+                                   const float *hullPoints, uint32_t hullPointCount) {
     RefConst<Shape> shape;
-    switch (desc.shape) {
+    switch (kind) {
     case UJOLT_SHAPE_SPHERE:
-        shape = new SphereShape(std::max(desc.radius, 1e-4f));
+        shape = new SphereShape(std::max(radius, 1e-4f));
         break;
     case UJOLT_SHAPE_BOX: {
-        Vec3 half = Vec3::sMax(v3(desc.half_extents), Vec3::sReplicate(1e-4f));
+        Vec3 half = Vec3::sMax(v3(halfExtents), Vec3::sReplicate(1e-4f));
         shape = new BoxShape(half);
         break;
     }
     case UJOLT_SHAPE_CAPSULE:
-        shape = new CapsuleShape(std::max(desc.half_height, 1e-4f), std::max(desc.radius, 1e-4f));
+        shape = new CapsuleShape(std::max(halfHeight, 1e-4f), std::max(radius, 1e-4f));
         break;
     case UJOLT_SHAPE_CYLINDER: {
-        const float halfHeight = std::max(desc.half_height, 1e-4f);
-        const float radius = std::max(desc.radius, 1e-4f);
-        shape = new CylinderShape(halfHeight, radius, std::min(cDefaultConvexRadius, std::min(halfHeight, radius)));
+        const float h = std::max(halfHeight, 1e-4f);
+        const float r = std::max(radius, 1e-4f);
+        shape = new CylinderShape(h, r, std::min(cDefaultConvexRadius, std::min(h, r)));
         break;
     }
     case UJOLT_SHAPE_CONVEX_HULL: {
-        if (desc.hull_points == nullptr || desc.hull_point_count < 4) return nullptr;
+        if (hullPoints == nullptr || hullPointCount < 4) return nullptr;
         std::vector<Vec3> points;
-        points.reserve(desc.hull_point_count);
+        points.reserve(hullPointCount);
         Vec3 lo = Vec3::sReplicate(FLT_MAX), hi = Vec3::sReplicate(-FLT_MAX);
-        for (uint32_t i = 0; i < desc.hull_point_count; ++i) {
-            const Vec3 p = v3(desc.hull_points + i * 3);
+        for (uint32_t i = 0; i < hullPointCount; ++i) {
+            const Vec3 p = v3(hullPoints + i * 3);
             points.push_back(p);
             lo = Vec3::sMin(lo, p);
             hi = Vec3::sMax(hi, p);
@@ -440,6 +514,12 @@ RefConst<Shape> makeShape(const ujolt_body_desc &desc) {
         break;
     }
     }
+    return shape;
+}
+
+RefConst<Shape> makeShape(const ujolt_body_desc &desc) {
+    RefConst<Shape> shape = makePrimitiveShape(desc.shape, desc.radius, desc.half_height, desc.half_extents,
+                                               desc.hull_points, desc.hull_point_count);
     if (shape == nullptr) return nullptr;
 
     const Vec3 offset = v3(desc.local_offset);
@@ -637,6 +717,7 @@ void ujolt_world_remove_body(ujolt_world *world, ujolt_body_id body) {
         auto it = world->records.find(body);
         if (it == world->records.end()) return;
         if (it->second.inner) return; // owned by its character; goes with it
+        if (it->second.ragdoll) return; // owned by its ragdoll; goes with it
         world->removedRecords[body] = it->second;
         world->records.erase(it);
     }
@@ -743,6 +824,19 @@ void ujolt_world_step(ujolt_world *world, float dt, int32_t collision_steps) {
     }
     world->kinematicTargets.clear();
 
+    // A ragdoll's kinematic parts follow its kinematic pose the same way,
+    // and keep following it every substep until a new one replaces it.
+    for (ujolt_ragdoll *ragdoll : world->ragdolls) {
+        if (!ragdoll->kinematicPending || !ragdoll->active) continue;
+        for (size_t i = 0; i < ragdoll->parts.size(); ++i) {
+            const BodyID id(ragdoll->parts[i]);
+            if (bi.GetMotionType(id) != EMotionType::Kinematic) continue;
+            const Mat44 &target = ragdoll->kinematicPose[i];
+            bi.ActivateBody(id);
+            bi.MoveKinematic(id, RVec3(target.GetTranslation()), target.GetQuaternion(), dt);
+        }
+    }
+
     if (world->broadPhaseDirty) {
         world->system.OptimizeBroadPhase();
         world->broadPhaseDirty = false;
@@ -773,7 +867,7 @@ uint32_t ujolt_world_changed_bodies(ujolt_world *world, ujolt_body_id *ids, uint
     auto emit = [&](const BodyID &id) {
         if (written >= capacity) return;
         BodyRecord record;
-        if (!world->lookup(id, record) || record.motion != EMotionType::Dynamic || record.soft) return;
+        if (!world->lookup(id, record) || record.motion != EMotionType::Dynamic || record.soft || record.ragdoll) return;
         ids[written++] = id.GetIndexAndSequenceNumber();
     };
     // Jolt's active list has no duplicates; only the (small) just-asleep
@@ -993,6 +1087,326 @@ uint32_t ujolt_character_contacts(const ujolt_character *character, ujolt_charac
 
 ujolt_body_id ujolt_character_inner_body(const ujolt_character *character) {
     return character->innerBody;
+}
+
+} // extern "C"
+
+// MARK: - Ragdolls
+
+namespace {
+
+/// The constraint joining a part to its parent. Every one is a
+/// SwingTwistConstraint (nothing else is ever put in mToParent); nullptr
+/// for the root, which has none.
+SwingTwistConstraint *jointOf(const ujolt_ragdoll *ragdoll, size_t part) {
+    const int index = ragdoll->settings->GetConstraintIndexForBodyIndex(int(part));
+    if (index < 0) return nullptr;
+    return static_cast<SwingTwistConstraint *>(ragdoll->ragdoll->GetConstraint(index));
+}
+
+/// The parts a `part` argument names: that one, or all of them for -1.
+bool partRange(const ujolt_ragdoll *ragdoll, int32_t part, size_t &first, size_t &end) {
+    const size_t count = ragdoll->parts.size();
+    if (part < 0) {
+        first = 0;
+        end = count;
+        return true;
+    }
+    if (size_t(part) >= count) return false;
+    first = size_t(part);
+    end = first + 1;
+    return true;
+}
+
+/// Wakes whatever rests on the parts before they leave the world (Jolt
+/// would let it hover asleep), as ujolt_world_remove_body does.
+void wakeAroundRagdoll(ujolt_ragdoll *ragdoll) {
+    if (!ragdoll->active) return;
+    AABox bounds = ragdoll->ragdoll->GetWorldSpaceBounds();
+    if (!bounds.IsValid()) return;
+    bounds.ExpandBy(Vec3::sReplicate(0.05f));
+    ragdoll->world->system.GetBodyInterface().ActivateBodiesInAABox(bounds, BroadPhaseLayerFilter(), ObjectLayerFilter());
+}
+
+/// A rigid pose matrix's rotation; normalised so a slightly scaled or
+/// drifted game matrix still yields a unit quaternion.
+inline Quat rotationOf(const float *matrix) {
+    return mat44(matrix).GetQuaternion().Normalized();
+}
+
+} // namespace
+
+extern "C" {
+
+ujolt_ragdoll *ujolt_world_add_ragdoll(ujolt_world *world, const ujolt_ragdoll_desc *desc) {
+    if (desc == nullptr || desc->parts == nullptr || desc->part_count == 0) return nullptr;
+    const uint32_t count = desc->part_count;
+    // One root, part 0; every other part's parent before it (Jolt's
+    // skeleton algorithms assume the order).
+    for (uint32_t i = 0; i < count; ++i) {
+        const ujolt_ragdoll_part &p = desc->parts[i];
+        if (i == 0 ? p.parent != -1 : (p.parent < 0 || uint32_t(p.parent) >= i)) return nullptr;
+        if (p.shape == UJOLT_SHAPE_CONVEX_HULL) return nullptr;
+    }
+
+    Ref<Skeleton> skeleton = new Skeleton();
+    for (uint32_t i = 0; i < count; ++i) {
+        const ujolt_ragdoll_part &p = desc->parts[i];
+        skeleton->AddJoint(p.name ? p.name : "", int(p.parent));
+    }
+    if (!skeleton->AreJointsCorrectlyOrdered()) return nullptr;
+
+    Ref<RagdollSettings> settings = new RagdollSettings();
+    settings->mSkeleton = skeleton;
+    settings->mParts.resize(count);
+    std::vector<Mat44> neutral(count);
+    const ObjectLayer layer = objectLayer(desc->layer, true);
+    for (uint32_t i = 0; i < count; ++i) {
+        const ujolt_ragdoll_part &p = desc->parts[i];
+        RefConst<Shape> shape = makePrimitiveShape(p.shape, p.radius, p.half_height, p.half_extents, nullptr, 0);
+        if (shape == nullptr) return nullptr;
+        const Vec3 offset = v3(p.shape_offset);
+        const Quat shapeRotation = q4(p.shape_rotation);
+        if (offset.LengthSq() > 1e-12f || shapeRotation.GetXYZ().LengthSq() > 1e-12f) {
+            shape = new RotatedTranslatedShape(offset, shapeRotation, shape);
+        }
+        RagdollSettings::Part &part = settings->mParts[i];
+        part.SetShape(shape);
+        part.mPosition = RVec3(v3(p.position));
+        part.mRotation = q4(p.rotation);
+        neutral[i] = Mat44::sRotationTranslation(part.mRotation, Vec3(part.mPosition));
+        // Kinematic until the game says otherwise; the motion properties
+        // exist either way, so a part can switch at any time.
+        part.mMotionType = EMotionType::Kinematic;
+        part.mAllowDynamicOrKinematic = true;
+        part.mObjectLayer = layer;
+        part.mUserData = desc->user_data;
+        part.mGravityFactor = desc->gravity_factor;
+        part.mLinearDamping = orDefault(desc->linear_damping, 0.05f);
+        part.mAngularDamping = orDefault(desc->angular_damping, 0.05f);
+        part.mMaxLinearVelocity = orDefault(desc->max_linear_velocity, 50.0f);
+        if (p.mass > 0.0f) {
+            part.mOverrideMassProperties = EOverrideMassProperties::CalculateInertia;
+            part.mMassPropertiesOverride.mMass = p.mass;
+        }
+        if (world->continuousCollision) part.mMotionQuality = EMotionQuality::LinearCast;
+
+        if (p.parent >= 0) {
+            // Both frames at this part's pivot in the neutral pose; Jolt
+            // converts them into each body's local space at creation.
+            Ref<SwingTwistConstraintSettings> joint = new SwingTwistConstraintSettings();
+            joint->mSpace = EConstraintSpace::WorldSpace;
+            joint->mPosition1 = part.mPosition;
+            joint->mPosition2 = part.mPosition;
+            Vec3 twist = v3(p.twist_axis);
+            twist = twist.LengthSq() > 1e-12f ? twist.Normalized() : Vec3::sAxisY();
+            Vec3 plane = v3(p.plane_axis);
+            plane -= twist * plane.Dot(twist);
+            plane = plane.LengthSq() > 1e-12f ? plane.Normalized() : twist.GetNormalizedPerpendicular();
+            joint->mTwistAxis1 = twist;
+            joint->mTwistAxis2 = twist;
+            joint->mPlaneAxis1 = plane;
+            joint->mPlaneAxis2 = plane;
+            joint->mNormalHalfConeAngle = DegreesToRadians(std::clamp(p.normal_half_cone_deg, 0.0f, 180.0f));
+            joint->mPlaneHalfConeAngle = DegreesToRadians(std::clamp(p.plane_half_cone_deg, 0.0f, 180.0f));
+            const float twistMin = std::clamp(p.twist_min_deg, -180.0f, 180.0f);
+            const float twistMax = std::clamp(p.twist_max_deg, -180.0f, 180.0f);
+            joint->mTwistMinAngle = DegreesToRadians(std::min(twistMin, twistMax));
+            joint->mTwistMaxAngle = DegreesToRadians(std::max(twistMin, twistMax));
+            joint->mMaxFrictionTorque = std::max(p.friction_torque, 0.0f);
+            const MotorSettings motor(ESpringMode::FrequencyAndDamping, orDefault(p.motor_frequency, 20.0f),
+                                      orDefault(p.motor_damping, 2.0f), FLT_MAX, orDefault(p.max_torque, 500.0f));
+            joint->mSwingMotorSettings = motor;
+            joint->mTwistMotorSettings = motor;
+            part.mToParent = joint;
+        }
+    }
+
+    // Jolt's recipe: bound the parent/child mass ratios and raise parent
+    // inertias so the chain does not blow up, filter parent/child (and
+    // overlapping-at-rest) pairs, then solve the root's joints first.
+    if (!settings->Stabilize()) return nullptr;
+    settings->DisableParentChildCollisions(neutral.data(), 0.0f);
+    settings->CalculateBodyIndexToConstraintIndex();
+    settings->CalculateConstraintPriorities();
+
+    Ragdoll *created = settings->CreateRagdoll(world->nextRagdollGroup++, desc->user_data, &world->system);
+    if (created == nullptr) return nullptr;
+
+    ujolt_ragdoll *ragdoll = new ujolt_ragdoll();
+    ragdoll->world = world;
+    ragdoll->skeleton = skeleton;
+    ragdoll->settings = settings;
+    ragdoll->ragdoll = created;
+    ragdoll->parts.reserve(count);
+    ragdoll->motors.assign(count, UJOLT_MOTOR_OFF);
+    ragdoll->kinematicPose = neutral;
+    {
+        std::lock_guard<std::mutex> guard(world->recordMutex);
+        for (uint32_t i = 0; i < count; ++i) {
+            const ujolt_body_id id = created->GetBodyID(int(i)).GetIndexAndSequenceNumber();
+            ragdoll->parts.push_back(id);
+            BodyRecord record{desc->user_data, false, EMotionType::Dynamic};
+            record.ragdoll = true;
+            world->records[id] = record;
+        }
+    }
+    if (desc->start_active != 0) {
+        created->AddToPhysicsSystem(EActivation::Activate);
+        ragdoll->active = true;
+    }
+    world->broadPhaseDirty = true;
+    world->ragdolls.insert(ragdoll);
+    return ragdoll;
+}
+
+void ujolt_world_remove_ragdoll(ujolt_world *world, ujolt_ragdoll *ragdoll) {
+    if (ragdoll == nullptr || world->ragdolls.erase(ragdoll) == 0) return;
+    wakeAroundRagdoll(ragdoll);
+    world->releaseRagdoll(ragdoll, true);
+}
+
+uint32_t ujolt_ragdoll_part_count(const ujolt_ragdoll *ragdoll) {
+    return uint32_t(ragdoll->parts.size());
+}
+
+void ujolt_ragdoll_set_active(ujolt_ragdoll *ragdoll, int32_t active) {
+    if ((active != 0) == ragdoll->active) return;
+    if (active != 0) {
+        ragdoll->ragdoll->AddToPhysicsSystem(EActivation::Activate);
+        ragdoll->active = true;
+    } else {
+        wakeAroundRagdoll(ragdoll);
+        // Constraints go before bodies; Jolt orders that itself.
+        ragdoll->ragdoll->RemoveFromPhysicsSystem();
+        ragdoll->active = false;
+    }
+    ragdoll->world->broadPhaseDirty = true;
+}
+
+int32_t ujolt_ragdoll_is_active(const ujolt_ragdoll *ragdoll) {
+    return ragdoll->active ? 1 : 0;
+}
+
+void ujolt_ragdoll_set_pose(ujolt_ragdoll *ragdoll, const float *world_matrices, int32_t reset_velocities) {
+    if (world_matrices == nullptr) return;
+    BodyInterface &bi = ragdoll->world->system.GetBodyInterface();
+    for (size_t i = 0; i < ragdoll->parts.size(); ++i) {
+        const BodyID id(ragdoll->parts[i]);
+        const Mat44 m = mat44(world_matrices + i * 16);
+        // Never through Activate here: a part of an inactive ragdoll is not
+        // in the broad phase, which activation asserts.
+        bi.SetPositionAndRotation(id, RVec3(m.GetTranslation()), m.GetQuaternion().Normalized(), EActivation::DontActivate);
+        if (reset_velocities != 0) bi.SetLinearAndAngularVelocity(id, Vec3::sZero(), Vec3::sZero());
+    }
+    // The constraints' remembered impulses belong to the old pose.
+    ragdoll->ragdoll->ResetWarmStart();
+    if (ragdoll->active) ragdoll->ragdoll->Activate();
+}
+
+void ujolt_ragdoll_set_velocities(ujolt_ragdoll *ragdoll, const float *linear, const float *angular) {
+    if (linear == nullptr) return;
+    // Through the lock rather than the BodyInterface, which would wake a
+    // body given a velocity (and assert on one of an inactive ragdoll).
+    const BodyLockInterface &lockInterface = ragdoll->world->system.GetBodyLockInterface();
+    for (size_t i = 0; i < ragdoll->parts.size(); ++i) {
+        BodyLockWrite lock(lockInterface, BodyID(ragdoll->parts[i]));
+        if (!lock.Succeeded()) continue;
+        Body &body = lock.GetBody();
+        body.SetLinearVelocityClamped(v3(linear + i * 3));
+        body.SetAngularVelocityClamped(angular ? v3(angular + i * 3) : Vec3::sZero());
+    }
+    // A sleeping body's velocity is dropped when it wakes on its own.
+    if (ragdoll->active) ragdoll->ragdoll->Activate();
+}
+
+void ujolt_ragdoll_set_kinematic_pose(ujolt_ragdoll *ragdoll, const float *world_matrices) {
+    if (world_matrices == nullptr) return;
+    for (size_t i = 0; i < ragdoll->parts.size(); ++i) {
+        ragdoll->kinematicPose[i] = mat44(world_matrices + i * 16);
+    }
+    ragdoll->kinematicPending = true;
+}
+
+void ujolt_ragdoll_drive_motors(ujolt_ragdoll *ragdoll, const float *world_matrices) {
+    if (world_matrices == nullptr) return;
+    // Jolt's own DriveToPoseUsingMotors would switch every motor on; only
+    // the joints the game put in position mode take a target here.
+    const Skeleton &skeleton = *ragdoll->skeleton;
+    for (size_t i = 0; i < ragdoll->parts.size(); ++i) {
+        if (ragdoll->motors[i] != UJOLT_MOTOR_POSITION) continue;
+        SwingTwistConstraint *joint = jointOf(ragdoll, i);
+        if (joint == nullptr) continue;
+        const int parent = skeleton.GetJoint(int(i)).mParentJointIndex;
+        // The target is body 2 (this part) relative to body 1 (its parent):
+        // this part's world rotation taken into the parent's frame.
+        const Quat own = rotationOf(world_matrices + i * 16);
+        const Quat parentRotation = rotationOf(world_matrices + size_t(parent) * 16);
+        joint->SetTargetOrientationBS(parentRotation.Conjugated() * own);
+    }
+}
+
+void ujolt_ragdoll_set_part_dynamic(ujolt_ragdoll *ragdoll, int32_t part, int32_t dynamic) {
+    size_t first, end;
+    if (!partRange(ragdoll, part, first, end)) return;
+    BodyInterface &bi = ragdoll->world->system.GetBodyInterface();
+    const EMotionType motion = dynamic != 0 ? EMotionType::Dynamic : EMotionType::Kinematic;
+    const EActivation activation = ragdoll->active ? EActivation::Activate : EActivation::DontActivate;
+    for (size_t i = first; i < end; ++i) {
+        const BodyID id(ragdoll->parts[i]);
+        if (bi.GetMotionType(id) == motion) continue;
+        bi.SetMotionType(id, motion, activation);
+        // A kinematic body keeps integrating whatever velocity it has: a
+        // part handed back to the animation must not fly on by itself.
+        if (motion == EMotionType::Kinematic) bi.SetLinearAndAngularVelocity(id, Vec3::sZero(), Vec3::sZero());
+    }
+}
+
+int32_t ujolt_ragdoll_part_is_dynamic(const ujolt_ragdoll *ragdoll, int32_t part) {
+    if (part < 0 || size_t(part) >= ragdoll->parts.size()) return 0;
+    const BodyID id(ragdoll->parts[size_t(part)]);
+    return ragdoll->world->system.GetBodyInterface().GetMotionType(id) == EMotionType::Dynamic ? 1 : 0;
+}
+
+void ujolt_ragdoll_set_motors(ujolt_ragdoll *ragdoll, int32_t part, ujolt_motor_mode mode, float frequency, float damping,
+                              float max_torque, float friction_torque) {
+    size_t first, end;
+    if (!partRange(ragdoll, part, first, end)) return;
+    const bool position = mode == UJOLT_MOTOR_POSITION;
+    const EMotorState state = position ? EMotorState::Position : EMotorState::Off;
+    for (size_t i = first; i < end; ++i) {
+        SwingTwistConstraint *joint = jointOf(ragdoll, i);
+        if (joint == nullptr) continue;
+        ragdoll->motors[i] = position ? UJOLT_MOTOR_POSITION : UJOLT_MOTOR_OFF;
+        joint->SetSwingMotorState(state);
+        joint->SetTwistMotorState(state);
+        for (MotorSettings *motor : {&joint->GetSwingMotorSettings(), &joint->GetTwistMotorSettings()}) {
+            if (frequency > 0.0f) motor->mSpringSettings.mFrequency = frequency;
+            if (damping > 0.0f) motor->mSpringSettings.mDamping = damping;
+            if (max_torque > 0.0f) motor->SetTorqueLimit(max_torque);
+        }
+        if (friction_torque > 0.0f) joint->SetMaxFrictionTorque(friction_torque);
+    }
+}
+
+uint32_t ujolt_ragdoll_read_pose(const ujolt_ragdoll *ragdoll, float *world_matrices, uint32_t capacity) {
+    if (world_matrices == nullptr) return 0;
+    const BodyInterface &bi = ragdoll->world->system.GetBodyInterface();
+    const uint32_t count = std::min<uint32_t>(capacity, uint32_t(ragdoll->parts.size()));
+    for (uint32_t i = 0; i < count; ++i) {
+        RVec3 position;
+        Quat rotation;
+        bi.GetPositionAndRotation(BodyID(ragdoll->parts[i]), position, rotation);
+        storeMat44(world_matrices + i * 16, Mat44::sRotationTranslation(rotation, Vec3(position)));
+    }
+    return count;
+}
+
+void ujolt_ragdoll_add_impulse(ujolt_ragdoll *ragdoll, int32_t part, const float impulse[3], const float world_point[3]) {
+    // Jolt applies it to dynamic bodies only and wakes them, which a part
+    // of an inactive ragdoll (not in the broad phase) cannot be.
+    if (!ragdoll->active || part < 0 || size_t(part) >= ragdoll->parts.size()) return;
+    ragdoll->world->system.GetBodyInterface().AddImpulse(BodyID(ragdoll->parts[size_t(part)]), v3(impulse), RVec3(v3(world_point)));
 }
 
 } // extern "C"

@@ -6,7 +6,7 @@
 //  Deliberately narrow: it mirrors the engine's PhysicsBackend protocol
 //  (bodies in, kinematic targets in, step, transforms out, buffered events
 //  out, one raycast) so the Swift side stays a thin adapter, plus the plugin's
-//  own extras (soft bodies, a character controller). All functions except
+//  own extras (soft bodies, a character controller, ragdolls). All functions except
 //  the event drains must be called from one thread (the engine's frame
 //  thread); Jolt's own worker threads never call back into Swift.
 //
@@ -278,6 +278,97 @@ int32_t ujolt_character_ground_state(const ujolt_character *character);
 uint32_t ujolt_character_contacts(const ujolt_character *character, ujolt_character_contact *out, uint32_t capacity);
 /// The inner body, or UJOLT_INVALID_BODY when the character has none.
 ujolt_body_id ujolt_character_inner_body(const ujolt_character *character);
+
+/* Ragdoll (Jolt's Ragdoll over SwingTwist constraints): a tree of rigid
+   parts, one per skeleton joint, each joined to its parent by a swing-twist
+   joint with a motor. A part is kinematic (it follows the pose the game
+   gives) or dynamic (simulated; its motor, when on, pulls it toward the
+   pose the game drives), so a knockdown is every part dynamic with the
+   motors off and some joint friction, and a hit reaction is the hit
+   subtree dynamic with motors driving it toward the live animation while
+   the rest stays kinematic. Every part reports the ragdoll's user_data in
+   contacts and rays; none is ever listed by ujolt_world_changed_bodies nor
+   removable with ujolt_world_remove_body. All calls are frame thread,
+   between steps. */
+typedef struct ujolt_ragdoll ujolt_ragdoll;
+
+typedef enum ujolt_motor_mode {
+    UJOLT_MOTOR_OFF = 0,
+    UJOLT_MOTOR_POSITION = 1
+} ujolt_motor_mode;
+
+typedef struct ujolt_ragdoll_part {
+    const char *name;
+    int32_t parent;                 /* index into the parts array; -1 for the root part; parents come before children */
+    ujolt_shape_type shape;         /* UJOLT_SHAPE_CAPSULE, _SPHERE or _BOX (a cylinder is taken too; never a hull) */
+    float radius;                   /* sphere, capsule */
+    float half_height;              /* capsule (cylindrical part) */
+    float half_extents[3];          /* box */
+    float shape_offset[3];          /* the shape's centre in the part's frame (the body origin is the joint pivot) */
+    float shape_rotation[4];        /* the shape's rotation in the part's frame, x y z w (a capsule/cylinder axis is its local Y) */
+    float mass;                     /* kg; <= 0 -> from the shape's volume. Jolt's stabilisation then clamps every
+                                       parent/child mass ratio to 0.8..1.2, keeping the total */
+    float position[3];              /* the neutral pose, world: the joint pivot = the body origin */
+    float rotation[4];              /* the neutral pose, world: the joint frame, x y z w */
+    float twist_axis[3];            /* constraint to the parent, at this pivot, in the neutral pose: twist axis (world; along this part's bone) */
+    float plane_axis[3];            /* and a perpendicular axis; made orthogonal to the twist axis if it is not */
+    float twist_min_deg;            /* twist range about twist_axis, -180..180 */
+    float twist_max_deg;
+    float normal_half_cone_deg;     /* swing limits: half angles of the cone about the normal (twist x plane) axis */
+    float plane_half_cone_deg;      /* and about the plane axis, 0..180 */
+    float motor_frequency;          /* Hz of the motor spring; <= 0 -> 20 */
+    float motor_damping;            /* damping ratio; <= 0 -> 2 */
+    float max_torque;               /* N m the motor may apply; <= 0 -> 500 */
+    float friction_torque;          /* N m of resistance while the motors are off */
+} ujolt_ragdoll_part;
+
+typedef struct ujolt_ragdoll_desc {
+    const ujolt_ragdoll_part *parts;
+    uint32_t part_count;
+    uint64_t user_data;             /* the entity every part reports (contacts, rays) */
+    uint32_t layer;                 /* engine collision layer 0..31 for every part */
+    float gravity_factor;           /* 1 = normal */
+    float linear_damping;           /* <= 0 -> Jolt's default (0.05) */
+    float angular_damping;          /* <= 0 -> Jolt's default (0.05) */
+    float max_linear_velocity;      /* m/s; <= 0 -> 50 */
+    int32_t start_active;           /* 0/1: whether the parts are in the world at creation */
+} ujolt_ragdoll_desc;
+
+/// NULL for a bad description: no parts, a parent index not before its
+/// child, a root that is not part 0 or more than one root, a hull shape,
+/// or Jolt out of bodies. The parts start kinematic, motors off.
+ujolt_ragdoll *ujolt_world_add_ragdoll(ujolt_world *world, const ujolt_ragdoll_desc *desc);
+void ujolt_world_remove_ragdoll(ujolt_world *world, ujolt_ragdoll *ragdoll);
+uint32_t ujolt_ragdoll_part_count(const ujolt_ragdoll *ragdoll);
+/// Adds the parts and constraints to the world / removes them (they keep
+/// their state); idempotent.
+void ujolt_ragdoll_set_active(ujolt_ragdoll *ragdoll, int32_t active);
+int32_t ujolt_ragdoll_is_active(const ujolt_ragdoll *ragdoll);
+/* Poses are one 4x4 rigid world transform per part, 16 floats column-major
+   (simd_float4x4 layout), body origin = joint pivot. */
+/// Teleports every part; resets the constraints' warm start; wakes the
+/// ragdoll when active.
+void ujolt_ragdoll_set_pose(ujolt_ragdoll *ragdoll, const float *world_matrices, int32_t reset_velocities);
+/// 3 floats per part each; angular may be NULL.
+void ujolt_ragdoll_set_velocities(ujolt_ragdoll *ragdoll, const float *linear, const float *angular);
+/// The pose the kinematic parts move to during the next step(s), carrying
+/// the implied velocity; kept until replaced. Dynamic parts ignore it.
+void ujolt_ragdoll_set_kinematic_pose(ujolt_ragdoll *ragdoll, const float *world_matrices);
+/// Motor targets (local rotations derived from the pose) for every
+/// constraint whose motors are in position mode; consumed by the next step.
+void ujolt_ragdoll_drive_motors(ujolt_ragdoll *ragdoll, const float *world_matrices);
+/// part -1 = all; dynamic 0 = kinematic (a part made kinematic stops where
+/// it is until it is given a pose).
+void ujolt_ragdoll_set_part_dynamic(ujolt_ragdoll *ragdoll, int32_t part, int32_t dynamic);
+int32_t ujolt_ragdoll_part_is_dynamic(const ujolt_ragdoll *ragdoll, int32_t part);
+/// part -1 = all (the root has no constraint and is skipped); values <= 0
+/// keep the part's current setting.
+void ujolt_ragdoll_set_motors(ujolt_ragdoll *ragdoll, int32_t part, ujolt_motor_mode mode, float frequency, float damping, float max_torque, float friction_torque);
+/// Current world transform of every part; returns the count written
+/// (capped at capacity).
+uint32_t ujolt_ragdoll_read_pose(const ujolt_ragdoll *ragdoll, float *world_matrices, uint32_t capacity);
+/// N s at a world point; dynamic parts of an active ragdoll only.
+void ujolt_ragdoll_add_impulse(ujolt_ragdoll *ragdoll, int32_t part, const float impulse[3], const float world_point[3]);
 
 #ifdef __cplusplus
 }
