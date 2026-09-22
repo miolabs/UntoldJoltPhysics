@@ -210,6 +210,18 @@ public final class JoltRagdoll: @unchecked Sendable {
         ujolt_ragdoll_set_part_dynamic(handle, index.map { Int32($0) } ?? -1, dynamic ? 1 : 0)
     }
 
+    /// Adds m/s to the linear velocity of a dynamic part (nil = every
+    /// dynamic part), on top of whatever it has: a shove of the whole body.
+    public func addLinearVelocity(_ delta: SIMD3<Float>, toPart index: Int? = nil) {
+        guard let handle else { return }
+        var d: (Float, Float, Float) = (delta.x, delta.y, delta.z)
+        withUnsafePointer(to: &d) { pointer in
+            pointer.withMemoryRebound(to: Float.self, capacity: 3) {
+                ujolt_ragdoll_add_linear_velocity(handle, index.map { Int32($0) } ?? -1, $0)
+            }
+        }
+    }
+
     /// Gravity on a part (nil = every part): 1 is the world's, 0 none. A
     /// reacting limb the animation holds feels only the hit.
     public func setGravityFactor(_ index: Int?, _ factor: Float) {

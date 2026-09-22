@@ -389,6 +389,8 @@ uint32_t ujolt_ragdoll_read_pose(const ujolt_ragdoll *ragdoll, float *world_matr
 /// N s at a world point; dynamic parts of an active ragdoll only.
 /** N s applied to a dynamic part at a world point, or at its centre of mass when world_point is NULL (a push without spin). */
 void ujolt_ragdoll_add_impulse(ujolt_ragdoll *ragdoll, int32_t part, const float impulse[3], const float world_point[3]);
+/** Adds m/s to a part's linear velocity (-1 = every part), on top of whatever it has: a shove of the whole body. */
+void ujolt_ragdoll_add_linear_velocity(ujolt_ragdoll *ragdoll, int32_t part, const float delta[3]);
 /** Gravity on a part (-1 = every part): 1 = the world's, 0 = none. A reacting limb held by the animation feels only the hit. */
 void ujolt_ragdoll_set_gravity_factor(ujolt_ragdoll *ragdoll, int32_t part, float factor);
 /** The rotation of a part's joint in its constraint space (x y z w): identity where the parent's and the part's

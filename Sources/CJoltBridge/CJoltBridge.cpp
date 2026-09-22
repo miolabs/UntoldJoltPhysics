@@ -1505,6 +1505,20 @@ void ujolt_ragdoll_add_impulse(ujolt_ragdoll *ragdoll, int32_t part, const float
     else bi.AddImpulse(id, v3(impulse), RVec3(v3(world_point)));
 }
 
+void ujolt_ragdoll_add_linear_velocity(ujolt_ragdoll *ragdoll, int32_t part, const float delta[3]) {
+    size_t first, end;
+    if (!partRange(ragdoll, part, first, end)) return;
+    const BodyLockInterface &lockInterface = ragdoll->world->system.GetBodyLockInterface();
+    for (size_t i = first; i < end; ++i) {
+        BodyLockWrite lock(lockInterface, BodyID(ragdoll->parts[i]));
+        if (!lock.Succeeded()) continue;
+        Body &body = lock.GetBody();
+        if (!body.IsDynamic()) continue;
+        body.SetLinearVelocityClamped(body.GetLinearVelocity() + v3(delta));
+    }
+    if (ragdoll->active) ragdoll->ragdoll->Activate();
+}
+
 void ujolt_ragdoll_set_gravity_factor(ujolt_ragdoll *ragdoll, int32_t part, float factor) {
     size_t first, end;
     if (!partRange(ragdoll, part, first, end)) return;

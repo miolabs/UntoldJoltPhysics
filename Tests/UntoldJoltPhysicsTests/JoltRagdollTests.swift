@@ -572,4 +572,20 @@ final class JoltRagdollTests: XCTestCase {
         advance(backend, seconds: 1)
         XCTAssertLessThan(tip().y, held.y - 0.05, "and gravity takes it down again")
     }
+
+    func testAddedVelocityShovesTheDynamicPartsAndLeavesKinematicOnesAlone() {
+        let backend = makeBackend()
+        let ragdoll = makeChain(backend)
+        ragdoll.setKinematicPose(neutralPose())
+        ragdoll.setPartDynamic(2, true)
+        ragdoll.setMotors(nil, mode: .off)
+        ragdoll.setGravityFactor(nil, 0)
+        ragdoll.addLinearVelocity(SIMD3<Float>(0, 0, 3))
+        advance(backend, seconds: 0.1)
+        var pose: [simd_float4x4] = []
+        ragdoll.readPose(into: &pose)
+        let tip = pose[2] * SIMD4<Float>(0, 0.3, 0, 1)
+        XCTAssertGreaterThan(tip.z, 0.05, "the dynamic part swings along +Z: \(tip.z)")
+        XCTAssertEqual(pose[1].columns.3.z, 0, accuracy: 1e-3, "the kinematic part stays where its pose puts it")
+    }
 }
