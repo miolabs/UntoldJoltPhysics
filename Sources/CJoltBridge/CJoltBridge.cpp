@@ -144,8 +144,17 @@ struct ujolt_character final : public CharacterContactListener {
     CharacterVirtual::ExtendedUpdateSettings extended;
     ujolt_body_id innerBody = UJOLT_INVALID_BODY;
     bool pushedByDynamicBodies = false;
+    bool ignoresDynamicBodies = false;
     /// What the last move produced: displacement over its dt.
     Vec3 effectiveVelocity = Vec3::sZero();
+
+    // A discarded contact never becomes a constraint nor an impulse: with
+    // dynamic bodies ignored, a ball flies into the inner body (a plain
+    // kinematic body the world's listener reports) instead of being caught
+    // and stopped by the character's own collision, which no listener sees.
+    bool OnContactValidate(const CharacterVirtual *, const CharacterContact &contact) override {
+        return !(ignoresDynamicBodies && contact.mMotionTypeB == EMotionType::Dynamic);
+    }
 
     // Synchronous, on the thread running the move. With mCanPushCharacter
     // off Jolt drops the constraint's velocity (the body's own and the
@@ -1002,6 +1011,7 @@ ujolt_character *ujolt_world_add_character(ujolt_world *world, const ujolt_chara
     character->extended.mStickToFloorStepDown = Vec3(0.0f, -std::max(desc->stick_to_floor_step_down, 0.0f), 0.0f);
     character->extended.mWalkStairsStepUp = Vec3(0.0f, std::max(desc->walk_stairs_step_up, 0.0f), 0.0f);
     character->pushedByDynamicBodies = desc->pushed_by_dynamic_bodies != 0;
+    character->ignoresDynamicBodies = desc->ignores_dynamic_bodies != 0;
     character->character = new CharacterVirtual(settings, RVec3(v3(desc->position)), q4(desc->rotation),
                                                 desc->user_data, &world->system);
     character->character->SetListener(character);

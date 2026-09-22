@@ -239,6 +239,10 @@ typedef struct ujolt_character_desc {
                                           bounce off the character and rays hit it (registered with
                                           user_data; never read back, removed with the character) */
     float inner_body_fraction;         /* <= 0 -> 0.9 of the outer shape */
+    int32_t ignores_dynamic_bodies;    /* 0/1: the character's own collision (blocking, pushing) does not
+                                          see dynamic bodies at all; they meet only its inner body, whose
+                                          contacts the world reports. For a character whose hits a game
+                                          wants to hear about. */
     int32_t pushed_by_dynamic_bodies;  /* 0/1: whether dynamic bodies may shove the character. Off, a
                                           ball resting against it or hitting it never moves it, while
                                           the character still pushes the ball; kinematic bodies (a
