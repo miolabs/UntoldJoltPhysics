@@ -49,12 +49,21 @@ public struct JoltRagdollPart: Sendable {
     /// A perpendicular axis of that joint, made orthogonal to the twist
     /// axis if it is not.
     public var planeAxis: SIMD3<Float>
+    /// The same two axes as the parent holds them in the neutral pose,
+    /// world. Nil for the part's own: the limits are then centred on the
+    /// neutral pose. Rotate them away from the part's axes to centre the
+    /// cones elsewhere — a knee's on mid-flexion (turn them about the
+    /// plane axis, the hinge pin), so one symmetric cone covers straight to
+    /// fully bent and nothing beyond straight.
+    public var parentTwistAxis: SIMD3<Float>?
+    public var parentPlaneAxis: SIMD3<Float>?
     /// Twist about `twistAxis`, radians.
     public var twistRange: ClosedRange<Float> = -0.5 ... 0.5
-    /// Swing limits: the half angle of the cone about the normal (twist ×
-    /// plane) axis, radians.
+    /// Swing limits, radians: how far the bone may tilt toward the normal
+    /// (twist × plane) axis — a rotation about the plane axis, a hinge's
+    /// bend when the plane axis is its pin.
     public var normalHalfConeAngle: Float = 0.5
-    /// And about the plane axis, radians.
+    /// And how far toward the plane axis (a rotation about the normal).
     public var planeHalfConeAngle: Float = 0.5
     /// The motor spring, in Hz.
     public var motorFrequency: Float = 20
@@ -236,6 +245,19 @@ public final class JoltRagdoll: @unchecked Sendable {
 
     /// An impulse in N s at a world point, on a dynamic part of an active
     /// ragdoll; nothing happens to a kinematic one.
+    /// A part's joint rotation in its constraint space: identity where the
+    /// parent's and the part's axes meet, twist about X, swing about Y (the
+    /// normal axis) and Z (the plane axis). For tuning limits; nil for the
+    /// root.
+    public func jointRotation(ofPart index: Int) -> simd_quatf? {
+        guard let handle else { return nil }
+        var q: (Float, Float, Float, Float) = (0, 0, 0, 1)
+        let ok = withUnsafeMutablePointer(to: &q) { pointer in
+            pointer.withMemoryRebound(to: Float.self, capacity: 4) { ujolt_ragdoll_read_joint_rotation(handle, Int32(index), $0) }
+        }
+        return ok != 0 ? simd_quatf(ix: q.0, iy: q.1, iz: q.2, r: q.3) : nil
+    }
+
     public func addImpulse(_ impulse: SIMD3<Float>, toPart index: Int, at worldPoint: SIMD3<Float>) {
         guard let handle else { return }
         var i: (Float, Float, Float) = (impulse.x, impulse.y, impulse.z)
@@ -316,6 +338,10 @@ extension JoltPhysicsBackend {
             c.rotation = (r.imag.x, r.imag.y, r.imag.z, r.real)
             c.twist_axis = (part.twistAxis.x, part.twistAxis.y, part.twistAxis.z)
             c.plane_axis = (part.planeAxis.x, part.planeAxis.y, part.planeAxis.z)
+            let parentTwist = part.parentTwistAxis ?? .zero
+            let parentPlane = part.parentPlaneAxis ?? .zero
+            c.parent_twist_axis = (parentTwist.x, parentTwist.y, parentTwist.z)
+            c.parent_plane_axis = (parentPlane.x, parentPlane.y, parentPlane.z)
             c.twist_min_deg = part.twistRange.lowerBound * 180 / .pi
             c.twist_max_deg = part.twistRange.upperBound * 180 / .pi
             c.normal_half_cone_deg = part.normalHalfConeAngle * 180 / .pi

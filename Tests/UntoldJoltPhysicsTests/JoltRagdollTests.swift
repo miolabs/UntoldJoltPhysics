@@ -433,4 +433,62 @@ final class JoltRagdollTests: XCTestCase {
         let grippy = travel(friction: 1.0)
         XCTAssertGreaterThan(slippery, grippy + 0.3, "friction shortens the slide: \(slippery) vs \(grippy)")
     }
+
+    /// A two-part hinge hanging from a kinematic root: the child's cone is
+    /// centred 60° into flexion (about +Z), so it may fold to 120° that way
+    /// and not at all the other.
+    func testParentAxesCentreTheConeOffTheNeutralPose() {
+        func settle(pushing direction: Float) -> Float {
+            let backend = makeBackend()
+            var parts: [JoltRagdollPart] = []
+            var root = JoltRagdollPart(
+                name: "root", parentIndex: nil, shape: .capsule(radius: 0.05, height: 0.2), mass: 5,
+                position: SIMD3<Float>(0, 2.0, 0), rotation: identity, twistAxis: SIMD3<Float>(0, 1, 0), planeAxis: SIMD3<Float>(0, 0, 1)
+            )
+            root.shapeOffset = SIMD3<Float>(0, 0.15, 0)
+            parts.append(root)
+            // The child hangs down from the root's pivot: its bone is -Y,
+            // the flexion axis +Z (a swing of +θ about it carries the bone
+            // toward +Z × -Y = +X, so the cone is centred toward +X).
+            var child = JoltRagdollPart(
+                name: "child", parentIndex: 0, shape: .capsule(radius: 0.04, height: 0.3), mass: 4,
+                position: SIMD3<Float>(0, 2.0, 0), rotation: identity, twistAxis: SIMD3<Float>(0, -1, 0), planeAxis: SIMD3<Float>(0, 0, 1)
+            )
+            child.shapeOffset = SIMD3<Float>(0, -0.19, 0)
+            // The bend tilts the bone toward the normal axis (+Z × -Y = +X),
+            // which the normal half cone limits; across it, a sliver.
+            child.normalHalfConeAngle = 60 * .pi / 180
+            child.planeHalfConeAngle = 2 * .pi / 180
+            child.twistRange = (-2 * Float.pi / 180) ... (2 * Float.pi / 180)
+            let centre = simd_quatf(angle: 60 * .pi / 180, axis: SIMD3<Float>(0, 0, 1))
+            child.parentTwistAxis = centre.act(child.twistAxis)
+            child.parentPlaneAxis = centre.act(child.planeAxis)
+            parts.append(child)
+            var descriptor = JoltRagdollDescriptor(parts: parts)
+            descriptor.entity = zombie
+            descriptor.startActive = true
+            let ragdoll = backend.addRagdoll(descriptor)!
+            // In constraint space the child starts 60° from the centre.
+            let rest = ragdoll.jointRotation(ofPart: 1)!
+            XCTAssertEqual(2 * asin(abs(rest.imag.z)) * 180 / .pi, 60, accuracy: 0.5)
+            XCTAssertNil(ragdoll.jointRotation(ofPart: 0), "the root has no joint")
+            ragdoll.setPartDynamic(1, true)
+            ragdoll.setMotors(nil, mode: .off)
+            // A steady sideways shove on the child's tip.
+            for _ in 0 ..< 120 {
+                ragdoll.addImpulse(SIMD3<Float>(direction * 0.6, 0, 0), toPart: 1, at: SIMD3<Float>(0, 1.65, 0))
+                backend.step(deltaTime: step)
+            }
+            var pose: [simd_float4x4] = []
+            ragdoll.readPose(into: &pose)
+            let bone = pose[1] * SIMD4<Float>(0, -1, 0, 0)
+            // The bone's angle from straight down, signed toward +X.
+            return atan2(bone.x, -bone.y) * 180 / .pi
+        }
+        let flexed = settle(pushing: 1)
+        let extended = settle(pushing: -1)
+        XCTAssertGreaterThan(flexed, 100, "folds well past 60° into flexion: \(flexed)°")
+        XCTAssertLessThan(extended, 6, "and not beyond straight the other way: \(extended)°")
+        XCTAssertGreaterThan(extended, -6, "nor anywhere near the free pendulum's 60°: \(extended)°")
+    }
 }

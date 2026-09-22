@@ -1243,9 +1243,22 @@ ujolt_ragdoll *ujolt_world_add_ragdoll(ujolt_world *world, const ujolt_ragdoll_d
             Vec3 plane = v3(p.plane_axis);
             plane -= twist * plane.Dot(twist);
             plane = plane.LengthSq() > 1e-12f ? plane.Normalized() : twist.GetNormalizedPerpendicular();
-            joint->mTwistAxis1 = twist;
+            // The parent's frame defaults to the part's, centring the limits
+            // on the neutral pose; a rig hands in a rotated one to centre
+            // them elsewhere (mid-flexion for a hinge).
+            Vec3 parentTwist = v3(p.parent_twist_axis);
+            Vec3 parentPlane = v3(p.parent_plane_axis);
+            if (parentTwist.LengthSq() > 1e-12f) {
+                parentTwist = parentTwist.Normalized();
+                parentPlane -= parentTwist * parentPlane.Dot(parentTwist);
+                parentPlane = parentPlane.LengthSq() > 1e-12f ? parentPlane.Normalized() : parentTwist.GetNormalizedPerpendicular();
+            } else {
+                parentTwist = twist;
+                parentPlane = plane;
+            }
+            joint->mTwistAxis1 = parentTwist;
             joint->mTwistAxis2 = twist;
-            joint->mPlaneAxis1 = plane;
+            joint->mPlaneAxis1 = parentPlane;
             joint->mPlaneAxis2 = plane;
             joint->mNormalHalfConeAngle = DegreesToRadians(std::clamp(p.normal_half_cone_deg, 0.0f, 180.0f));
             joint->mPlaneHalfConeAngle = DegreesToRadians(std::clamp(p.plane_half_cone_deg, 0.0f, 180.0f));
@@ -1272,7 +1285,6 @@ ujolt_ragdoll *ujolt_world_add_ragdoll(ujolt_world *world, const ujolt_ragdoll_d
 
     Ragdoll *created = settings->CreateRagdoll(world->nextRagdollGroup++, desc->user_data, &world->system);
     if (created == nullptr) return nullptr;
-
     ujolt_ragdoll *ragdoll = new ujolt_ragdoll();
     ragdoll->world = world;
     ragdoll->skeleton = skeleton;
@@ -1446,6 +1458,13 @@ uint32_t ujolt_ragdoll_read_pose(const ujolt_ragdoll *ragdoll, float *world_matr
         storeMat44(world_matrices + i * 16, Mat44::sRotationTranslation(rotation, Vec3(position)));
     }
     return count;
+}
+
+int32_t ujolt_ragdoll_read_joint_rotation(const ujolt_ragdoll *ragdoll, int32_t part, float out_quat[4]) {
+    SwingTwistConstraint *joint = jointOf(ragdoll, part);
+    if (joint == nullptr) return 0;
+    store4(out_quat, joint->GetRotationInConstraintSpace());
+    return 1;
 }
 
 void ujolt_ragdoll_add_impulse(ujolt_ragdoll *ragdoll, int32_t part, const float impulse[3], const float world_point[3]) {

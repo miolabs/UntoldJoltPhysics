@@ -316,10 +316,15 @@ typedef struct ujolt_ragdoll_part {
     float rotation[4];              /* the neutral pose, world: the joint frame, x y z w */
     float twist_axis[3];            /* constraint to the parent, at this pivot, in the neutral pose: twist axis (world; along this part's bone) */
     float plane_axis[3];            /* and a perpendicular axis; made orthogonal to the twist axis if it is not */
+    float parent_twist_axis[3];     /* the same two axes as the PARENT holds them (world, neutral pose); all zero -> the part's own.
+                                       Limits are centred where the parent's frame meets the part's: rotate these away from the
+                                       part's axes and the cones sit off the neutral pose (a knee's cone centred mid-flexion) */
+    float parent_plane_axis[3];
     float twist_min_deg;            /* twist range about twist_axis, -180..180 */
     float twist_max_deg;
-    float normal_half_cone_deg;     /* swing limits: half angles of the cone about the normal (twist x plane) axis */
-    float plane_half_cone_deg;      /* and about the plane axis, 0..180 */
+    float normal_half_cone_deg;     /* swing limits, 0..180: how far the bone may tilt TOWARD the normal (twist x plane) axis,
+                                       i.e. a rotation about the plane axis — a hinge's bend when the plane axis is its pin */
+    float plane_half_cone_deg;      /* and how far toward the plane axis (a rotation about the normal axis) */
     float motor_frequency;          /* Hz of the motor spring; <= 0 -> 20 */
     float motor_damping;            /* damping ratio; <= 0 -> 2 */
     float max_torque;               /* N m the motor may apply; <= 0 -> 500 */
@@ -374,6 +379,9 @@ void ujolt_ragdoll_set_motors(ujolt_ragdoll *ragdoll, int32_t part, ujolt_motor_
 uint32_t ujolt_ragdoll_read_pose(const ujolt_ragdoll *ragdoll, float *world_matrices, uint32_t capacity);
 /// N s at a world point; dynamic parts of an active ragdoll only.
 void ujolt_ragdoll_add_impulse(ujolt_ragdoll *ragdoll, int32_t part, const float impulse[3], const float world_point[3]);
+/** The rotation of a part's joint in its constraint space (x y z w): identity where the parent's and the part's
+    axes meet, twist about X, swing about Y (the normal axis) and Z (the plane axis). For tuning limits; 0 for the root. */
+int32_t ujolt_ragdoll_read_joint_rotation(const ujolt_ragdoll *ragdoll, int32_t part, float out_quat[4]);
 
 #ifdef __cplusplus
 }

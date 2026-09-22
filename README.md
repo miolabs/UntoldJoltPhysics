@@ -133,7 +133,9 @@ built against, as the engine's validator demands.
   `JoltRagdoll`): Jolt's `Ragdoll` over swing-twist joints with motors, built
   from a `JoltRagdollDescriptor` — one rigid part per skeleton joint (capsule,
   sphere or box), parents before children, each joined to its parent by a
-  cone/twist limit at its pivot. Poses are one world transform per part with
+  cone/twist limit at its pivot (centred on the neutral pose, or wherever the
+  optional parent-side axes put it — mid-flexion for a knee; `jointRotation`
+  reads a joint back in that space for tuning). Poses are one world transform per part with
   the body origin at the joint pivot, in and out (`setPose` teleports,
   `readPose` reads back; a scaled or drifted matrix is read for the
   rotation it means). Each part is kinematic (it follows the pose given
