@@ -210,6 +210,13 @@ public final class JoltRagdoll: @unchecked Sendable {
         ujolt_ragdoll_set_part_dynamic(handle, index.map { Int32($0) } ?? -1, dynamic ? 1 : 0)
     }
 
+    /// Gravity on a part (nil = every part): 1 is the world's, 0 none. A
+    /// reacting limb the animation holds feels only the hit.
+    public func setGravityFactor(_ index: Int?, _ factor: Float) {
+        guard let handle else { return }
+        ujolt_ragdoll_set_gravity_factor(handle, index.map { Int32($0) } ?? -1, factor)
+    }
+
     /// Whether Jolt may put the parts to sleep when they come to rest (its
     /// default). A body settling through a slow topple can pause below the
     /// sleep threshold long enough to be frozen mid-fall: forbid sleeping
@@ -279,9 +286,17 @@ public final class JoltRagdoll: @unchecked Sendable {
         return ok != 0 ? simd_quatf(ix: q.0, iy: q.1, iz: q.2, r: q.3) : nil
     }
 
-    public func addImpulse(_ impulse: SIMD3<Float>, toPart index: Int, at worldPoint: SIMD3<Float>) {
+    /// N s on a dynamic part, at a world point — or at its centre of mass
+    /// when `worldPoint` is nil: a push without spin.
+    public func addImpulse(_ impulse: SIMD3<Float>, toPart index: Int, at worldPoint: SIMD3<Float>? = nil) {
         guard let handle else { return }
         var i: (Float, Float, Float) = (impulse.x, impulse.y, impulse.z)
+        guard let worldPoint else {
+            withUnsafePointer(to: &i) { ip in
+                ip.withMemoryRebound(to: Float.self, capacity: 3) { ujolt_ragdoll_add_impulse(handle, Int32(index), $0, nil) }
+            }
+            return
+        }
         var p: (Float, Float, Float) = (worldPoint.x, worldPoint.y, worldPoint.z)
         withUnsafePointer(to: &i) { ip in
             withUnsafePointer(to: &p) { pp in

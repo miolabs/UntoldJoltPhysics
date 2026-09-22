@@ -1499,7 +1499,17 @@ void ujolt_ragdoll_add_impulse(ujolt_ragdoll *ragdoll, int32_t part, const float
     // Jolt applies it to dynamic bodies only and wakes them, which a part
     // of an inactive ragdoll (not in the broad phase) cannot be.
     if (!ragdoll->active || part < 0 || size_t(part) >= ragdoll->parts.size()) return;
-    ragdoll->world->system.GetBodyInterface().AddImpulse(BodyID(ragdoll->parts[size_t(part)]), v3(impulse), RVec3(v3(world_point)));
+    BodyInterface &bi = ragdoll->world->system.GetBodyInterface();
+    const BodyID id(ragdoll->parts[size_t(part)]);
+    if (world_point == nullptr) bi.AddImpulse(id, v3(impulse));
+    else bi.AddImpulse(id, v3(impulse), RVec3(v3(world_point)));
+}
+
+void ujolt_ragdoll_set_gravity_factor(ujolt_ragdoll *ragdoll, int32_t part, float factor) {
+    size_t first, end;
+    if (!partRange(ragdoll, part, first, end)) return;
+    BodyInterface &bi = ragdoll->world->system.GetBodyInterface();
+    for (size_t i = first; i < end; ++i) bi.SetGravityFactor(BodyID(ragdoll->parts[i]), factor);
 }
 
 } // extern "C"

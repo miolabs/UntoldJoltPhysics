@@ -536,4 +536,40 @@ final class JoltRagdollTests: XCTestCase {
         let through = overlapAfterFold(disable: true)
         XCTAssertGreaterThan(apart, through + 0.03, "collision pushes the folded part out (\(apart) vs \(through))")
     }
+
+    func testGravityCanBeTurnedOffPerPartAndAnImpulseAtTheCentrePushesWithoutSpin() {
+        let backend = makeBackend()
+        var descriptor = chain()
+        descriptor.startActive = true
+        let ragdoll = backend.addRagdoll(descriptor)!
+        // The lower part free of gravity, hanging from a kinematic upper.
+        ragdoll.setKinematicPose(neutralPose())
+        ragdoll.setPartDynamic(2, true)
+        ragdoll.setMotors(nil, mode: .off)
+        ragdoll.setGravityFactor(2, 0)
+        // The part's origin is its pivot, which the joint holds: watch the
+        // far end of the capsule, 0.3 m up its axis, which stands above the
+        // pivot and would topple under gravity.
+        func tip() -> SIMD3<Float> {
+            var pose: [simd_float4x4] = []
+            ragdoll.readPose(into: &pose)
+            let t = pose[2] * SIMD4<Float>(0, 0.3, 0, 1)
+            return SIMD3<Float>(t.x, t.y, t.z)
+        }
+        let before = tip()
+        advance(backend, seconds: 1)
+        let held = tip()
+        XCTAssertEqual(held.y, before.y, accuracy: 0.02, "no gravity, no topple")
+
+        // A sideways impulse at the centre of mass: the part swings that way.
+        ragdoll.addImpulse(SIMD3<Float>(2, 0, 0), toPart: 2)
+        advance(backend, seconds: 0.2)
+        let pushed = tip()
+        XCTAssertGreaterThan(pushed.x, held.x + 0.03, "the push carries it along +X")
+
+        // Gravity back: it topples.
+        ragdoll.setGravityFactor(nil, 1)
+        advance(backend, seconds: 1)
+        XCTAssertLessThan(tip().y, held.y - 0.05, "and gravity takes it down again")
+    }
 }
