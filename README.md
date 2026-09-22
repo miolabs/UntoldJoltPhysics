@@ -135,13 +135,15 @@ built against, as the engine's validator demands.
   sphere or box), parents before children, each joined to its parent by a
   cone/twist limit at its pivot. Poses are one world transform per part with
   the body origin at the joint pivot, in and out (`setPose` teleports,
-  `readPose` reads back). Each part is kinematic (it follows the pose given
-  with `setKinematicPose`, which is re-applied every substep until replaced)
-  or dynamic (`setPartDynamic`: simulated, its joint motors when in position
+  `readPose` reads back; a scaled or drifted matrix is read for the
+  rotation it means). Each part is kinematic (it follows the pose given
+  with `setKinematicPose`, which is re-applied every substep until replaced,
+  under the world's kinematic teleport and speed guards) or dynamic (`setPartDynamic`: simulated, its joint motors when in position
   mode pulling it toward the local rotations `driveMotors` derives from the
   pose it is handed each frame). `setMotors` switches a joint's motors and
   retunes their spring, torque limit and the friction torque that resists
-  the joint while they are off. So a knockdown is every part dynamic with
+  the joint while they are off; a part's surface friction is set on its
+  descriptor (0.5 unless said otherwise). So a knockdown is every part dynamic with
   the motors off and some friction, the mesh following `readPose`; a hit
   reaction is the hit subtree dynamic with motors driving it toward the live
   animation while the rest stays kinematic; `addImpulse` delivers the hit.

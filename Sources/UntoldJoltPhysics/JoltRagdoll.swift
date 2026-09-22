@@ -64,6 +64,9 @@ public struct JoltRagdollPart: Sendable {
     public var maxTorque: Float = 500
     /// N m of resistance at the joint while its motors are off.
     public var frictionTorque: Float = 0
+    /// The part's surface friction against whatever it lands on (Jolt's
+    /// bodies default to 0.2, which slides).
+    public var friction: Float = 0.5
 
     public init(name: String, parentIndex: Int?, shape: PhysicsColliderShape, mass: Float,
                 position: SIMD3<Float>, rotation: simd_quatf, twistAxis: SIMD3<Float>, planeAxis: SIMD3<Float>)
@@ -321,6 +324,7 @@ extension JoltPhysicsBackend {
             c.motor_damping = part.motorDamping
             c.max_torque = part.maxTorque
             c.friction_torque = part.frictionTorque
+            c.friction = part.friction
             parts.append(c)
         }
         var desc = ujolt_ragdoll_desc()

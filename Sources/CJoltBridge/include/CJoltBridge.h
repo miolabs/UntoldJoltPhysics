@@ -324,6 +324,7 @@ typedef struct ujolt_ragdoll_part {
     float motor_damping;            /* damping ratio; <= 0 -> 2 */
     float max_torque;               /* N m the motor may apply; <= 0 -> 500 */
     float friction_torque;          /* N m of resistance while the motors are off */
+    float friction;                 /* the part's surface friction against what it lands on; <= 0 -> 0.5 */
 } ujolt_ragdoll_part;
 
 typedef struct ujolt_ragdoll_desc {

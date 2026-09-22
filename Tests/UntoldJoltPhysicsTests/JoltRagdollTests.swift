@@ -358,4 +358,79 @@ final class JoltRagdollTests: XCTestCase {
         }()
         XCTAssertTrue(ragdoll.isValid, "the handle is not told; the owner must not use it")
     }
+
+    // MARK: - Records, guards, friction
+
+    func testABallOnAKinematicPartIsReportedWithTheBallAsA() {
+        let backend = makeBackend()
+        let ragdoll = makeChain(backend)
+        ragdoll.setKinematicPose(neutralPose())
+        // The parts went dynamic and back: the records must have followed,
+        // or the ball and the part are both "dynamic" and A is whichever
+        // Jolt lists first.
+        ragdoll.setPartDynamic(nil, true)
+        ragdoll.setPartDynamic(nil, false)
+        // A ball dropped onto the lower part's capsule (its top is at
+        // 1.6 + 0.3 + 0.05 = 1.95 m).
+        backend.didAddBody(entity: 9, descriptor: PhysicsBodyDescriptor(
+            motionType: .dynamic,
+            collider: PhysicsColliderDescriptor(shape: .sphere(radius: 0.05), friction: 0.5, restitution: 0.0),
+            mass: 0.5,
+            position: SIMD3<Float>(0, 2.3, 0)
+        ))
+        let sink = RecordingSink()
+        advance(backend, seconds: 1, sink: sink)
+        let hits = sink.contacts.filter { $0.phase == .began && ($0.entityA == zombie || $0.entityB == zombie) }
+        XCTAssertFalse(hits.isEmpty, "the ball lands on the part")
+        for hit in hits {
+            XCTAssertEqual(hit.entityA, 9, "the dynamic body is A")
+            XCTAssertEqual(hit.entityB, zombie, "the kinematic part is B")
+        }
+    }
+
+    func testAFarKinematicPoseTeleportsWithoutSpeed() {
+        var settings = JoltWorldSettings()
+        settings.workerThreads = 0
+        settings.maxKinematicStep = 1
+        settings.maxKinematicSpeed = 6
+        let backend = JoltPhysicsBackend(settings: settings)
+        backend.configure(PhysicsWorldConfiguration())
+        let ragdoll = makeChain(backend)
+        // Far: a jump, with no implied velocity.
+        let far = heights.map { transform(SIMD3<Float>(5, $0, 0)) }
+        ragdoll.setKinematicPose(far)
+        backend.step(deltaTime: step)
+        let placed = positions(ragdoll)
+        XCTAssertEqual(placed[0].x, 5, accuracy: 1e-3)
+        XCTAssertEqual(placed[2].x, 5, accuracy: 1e-3)
+        // Near but fast: the parts approach at the cap, not in one step.
+        let near = heights.map { transform(SIMD3<Float>(5.5, $0, 0)) }
+        ragdoll.setKinematicPose(near)
+        backend.step(deltaTime: step)
+        let moved = positions(ragdoll)
+        XCTAssertLessThan(moved[0].x - placed[0].x, 6 * step + 1e-3, "no faster than the cap")
+        XCTAssertGreaterThan(moved[0].x, placed[0].x, "but on its way")
+    }
+
+    func testPartFrictionStopsASlidingPart() {
+        func travel(friction: Float) -> Float {
+            let backend = makeBackend()
+            var descriptor = chain()
+            descriptor.startActive = true
+            for index in descriptor.parts.indices { descriptor.parts[index].friction = friction }
+            let ragdoll = backend.addRagdoll(descriptor)!
+            // The chain laid flat on the floor, sliding along +X.
+            let flat = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(0, 0, 1))
+            let pose = heights.map { transform(SIMD3<Float>($0 - 1.0, 0.1, 0), flat) }
+            ragdoll.setPose(pose, resetVelocities: true)
+            ragdoll.setPartDynamic(nil, true)
+            ragdoll.setMotors(nil, mode: .off)
+            ragdoll.setVelocities(linear: Array(repeating: SIMD3<Float>(3, 0, 0), count: 3), angular: nil)
+            for _ in 0 ..< 90 { backend.step(deltaTime: step) }
+            return positions(ragdoll)[0].x
+        }
+        let slippery = travel(friction: 0.02)
+        let grippy = travel(friction: 1.0)
+        XCTAssertGreaterThan(slippery, grippy + 0.3, "friction shortens the slide: \(slippery) vs \(grippy)")
+    }
 }

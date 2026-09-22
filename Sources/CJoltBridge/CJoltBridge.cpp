@@ -81,6 +81,20 @@ inline Mat44 mat44(const float *m) {
     return Mat44(Vec4(m[0], m[1], m[2], m[3]), Vec4(m[4], m[5], m[6], m[7]),
                  Vec4(m[8], m[9], m[10], m[11]), Vec4(m[12], m[13], m[14], m[15]));
 }
+/// A pose matrix's rotation. The columns are orthonormalised first (Gram-
+/// Schmidt from X, right-handed), so a scaled or drifted game matrix — a
+/// scaled entity, accumulated float error — yields the rotation it means
+/// rather than the garbage GetQuaternion makes of a non-orthonormal 3x3.
+inline Quat rotationOf(const Mat44 &matrix) {
+    Vec3 x = matrix.GetAxisX();
+    x = x.LengthSq() > 1e-12f ? x.Normalized() : Vec3::sAxisX();
+    Vec3 y = matrix.GetAxisY();
+    y -= x * y.Dot(x);
+    y = y.LengthSq() > 1e-12f ? y.Normalized() : x.GetNormalizedPerpendicular();
+    const Vec3 z = x.Cross(y);
+    return Mat44(Vec4(x, 0.0f), Vec4(y, 0.0f), Vec4(z, 0.0f), Vec4(0.0f, 0.0f, 0.0f, 1.0f)).GetQuaternion().Normalized();
+}
+inline Quat rotationOf(const float *matrix) { return rotationOf(mat44(matrix)); }
 inline void storeMat44(float *out, Mat44Arg m) {
     for (uint c = 0; c < 4; ++c) {
         const Vec4 column = m.GetColumn4(c);
@@ -834,15 +848,35 @@ void ujolt_world_step(ujolt_world *world, float dt, int32_t collision_steps) {
     world->kinematicTargets.clear();
 
     // A ragdoll's kinematic parts follow its kinematic pose the same way,
-    // and keep following it every substep until a new one replaces it.
+    // with the same guards, and keep following it every substep until a
+    // new one replaces it.
     for (ujolt_ragdoll *ragdoll : world->ragdolls) {
         if (!ragdoll->kinematicPending || !ragdoll->active) continue;
         for (size_t i = 0; i < ragdoll->parts.size(); ++i) {
             const BodyID id(ragdoll->parts[i]);
             if (bi.GetMotionType(id) != EMotionType::Kinematic) continue;
             const Mat44 &target = ragdoll->kinematicPose[i];
+            const RVec3 position(target.GetTranslation());
+            const Quat rotation = rotationOf(target);
+            if (world->maxKinematicStep > 0.0f) {
+                RVec3 current;
+                Quat currentRotation;
+                bi.GetPositionAndRotation(id, current, currentRotation);
+                if (float(Vec3(position - current).Length()) > world->maxKinematicStep) {
+                    bi.SetPositionAndRotation(id, position, rotation, EActivation::Activate);
+                    bi.SetLinearAndAngularVelocity(id, Vec3::sZero(), Vec3::sZero());
+                    continue;
+                }
+            }
             bi.ActivateBody(id);
-            bi.MoveKinematic(id, RVec3(target.GetTranslation()), target.GetQuaternion(), dt);
+            bi.MoveKinematic(id, position, rotation, dt);
+            if (world->maxKinematicSpeed > 0.0f) {
+                const Vec3 velocity = bi.GetLinearVelocity(id);
+                const float speed = velocity.Length();
+                if (speed > world->maxKinematicSpeed) {
+                    bi.SetLinearVelocity(id, velocity * (world->maxKinematicSpeed / speed));
+                }
+            }
         }
     }
 
@@ -1138,11 +1172,6 @@ void wakeAroundRagdoll(ujolt_ragdoll *ragdoll) {
     ragdoll->world->system.GetBodyInterface().ActivateBodiesInAABox(bounds, BroadPhaseLayerFilter(), ObjectLayerFilter());
 }
 
-/// A rigid pose matrix's rotation; normalised so a slightly scaled or
-/// drifted game matrix still yields a unit quaternion.
-inline Quat rotationOf(const float *matrix) {
-    return mat44(matrix).GetQuaternion().Normalized();
-}
 
 } // namespace
 
@@ -1195,6 +1224,7 @@ ujolt_ragdoll *ujolt_world_add_ragdoll(ujolt_world *world, const ujolt_ragdoll_d
         part.mLinearDamping = orDefault(desc->linear_damping, 0.05f);
         part.mAngularDamping = orDefault(desc->angular_damping, 0.05f);
         part.mMaxLinearVelocity = orDefault(desc->max_linear_velocity, 50.0f);
+        part.mFriction = orDefault(p.friction, 0.5f);
         if (p.mass > 0.0f) {
             part.mOverrideMassProperties = EOverrideMassProperties::CalculateInertia;
             part.mMassPropertiesOverride.mMass = p.mass;
@@ -1256,7 +1286,10 @@ ujolt_ragdoll *ujolt_world_add_ragdoll(ujolt_world *world, const ujolt_ragdoll_d
         for (uint32_t i = 0; i < count; ++i) {
             const ujolt_body_id id = created->GetBodyID(int(i)).GetIndexAndSequenceNumber();
             ragdoll->parts.push_back(id);
-            BodyRecord record{desc->user_data, false, EMotionType::Dynamic};
+            // Kinematic like the body: the contact convention (the dynamic
+            // body is A) reads the record's motion type, which follows
+            // set_part_dynamic.
+            BodyRecord record{desc->user_data, false, EMotionType::Kinematic};
             record.ragdoll = true;
             world->records[id] = record;
         }
@@ -1306,7 +1339,7 @@ void ujolt_ragdoll_set_pose(ujolt_ragdoll *ragdoll, const float *world_matrices,
         const Mat44 m = mat44(world_matrices + i * 16);
         // Never through Activate here: a part of an inactive ragdoll is not
         // in the broad phase, which activation asserts.
-        bi.SetPositionAndRotation(id, RVec3(m.GetTranslation()), m.GetQuaternion().Normalized(), EActivation::DontActivate);
+        bi.SetPositionAndRotation(id, RVec3(m.GetTranslation()), rotationOf(m), EActivation::DontActivate);
         if (reset_velocities != 0) bi.SetLinearAndAngularVelocity(id, Vec3::sZero(), Vec3::sZero());
     }
     // The constraints' remembered impulses belong to the old pose.
@@ -1362,6 +1395,7 @@ void ujolt_ragdoll_set_part_dynamic(ujolt_ragdoll *ragdoll, int32_t part, int32_
     BodyInterface &bi = ragdoll->world->system.GetBodyInterface();
     const EMotionType motion = dynamic != 0 ? EMotionType::Dynamic : EMotionType::Kinematic;
     const EActivation activation = ragdoll->active ? EActivation::Activate : EActivation::DontActivate;
+    std::lock_guard<std::mutex> guard(ragdoll->world->recordMutex);
     for (size_t i = first; i < end; ++i) {
         const BodyID id(ragdoll->parts[i]);
         if (bi.GetMotionType(id) == motion) continue;
@@ -1369,6 +1403,8 @@ void ujolt_ragdoll_set_part_dynamic(ujolt_ragdoll *ragdoll, int32_t part, int32_
         // A kinematic body keeps integrating whatever velocity it has: a
         // part handed back to the animation must not fly on by itself.
         if (motion == EMotionType::Kinematic) bi.SetLinearAndAngularVelocity(id, Vec3::sZero(), Vec3::sZero());
+        auto record = ragdoll->world->records.find(ragdoll->parts[i]);
+        if (record != ragdoll->world->records.end()) record->second.motion = motion;
     }
 }
 
