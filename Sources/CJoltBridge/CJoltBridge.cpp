@@ -544,6 +544,7 @@ ujolt_body_id ujolt_world_add_soft_body(ujolt_world *world, const ujolt_soft_bod
     settings.mFriction = desc->friction;
     settings.mRestitution = desc->restitution;
     settings.mGravityFactor = desc->gravity_factor;
+    if (desc->max_linear_velocity > 0.0f) settings.mMaxLinearVelocity = desc->max_linear_velocity;
     // Hangs from its pinned vertices: the body's frame stays where it was made.
     settings.mUpdatePosition = false;
     settings.mMakeRotationIdentity = true;

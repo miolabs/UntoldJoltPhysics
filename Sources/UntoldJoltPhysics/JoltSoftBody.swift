@@ -48,6 +48,9 @@ public struct JoltSoftBodyDescriptor: Sendable {
     public var shearCompliance: Float = 1e-5
     /// Inverse bending stiffness; larger folds more easily.
     public var bendCompliance: Float = 1e-3
+    /// Ceiling on a vertex's speed (m/s; 0 = Jolt's default): bounds the
+    /// energy a resolved overlap or a yanked pin can put into the body.
+    public var maxLinearVelocity: Float = 0
 
     public init(vertices: [SIMD3<Float>], inverseMasses: [Float], edges: [SIMD2<UInt32>]) {
         self.vertices = vertices
@@ -111,6 +114,7 @@ extension JoltPhysicsBackend {
         desc.constraints_from_faces = descriptor.constraintsFromFaces ? 1 : 0
         desc.shear_compliance = descriptor.shearCompliance
         desc.bend_compliance = descriptor.bendCompliance
+        desc.max_linear_velocity = descriptor.maxLinearVelocity
         // Not an engine entity: its activations look like the environment's.
         desc.user_data = UInt64(Self.environmentEntity)
 
