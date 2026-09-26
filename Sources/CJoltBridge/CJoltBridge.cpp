@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -693,7 +694,10 @@ void ujolt_world_activate_in_box(ujolt_world *world, const float min[3], const f
 }
 
 void ujolt_world_step(ujolt_world *world, float dt, int32_t collision_steps) {
-    if (dt <= 0.0f) return;
+    // A non-finite or absurd step would poison every body (an infinite
+    // kinematic velocity, a NaN integration); a hitch is clamped.
+    if (!std::isfinite(dt) || dt <= 0.0f) return;
+    if (dt > 0.1f) dt = 0.1f;
     BodyInterface &bi = world->system.GetBodyInterface();
     for (const KinematicTarget &target : world->kinematicTargets) {
         if (!bi.IsAdded(target.id)) continue;
@@ -732,6 +736,39 @@ void ujolt_world_step(ujolt_world *world, float dt, int32_t collision_steps) {
     {
         std::lock_guard<std::mutex> guard(world->eventMutex);
         world->deactivatedThisStep.clear();
+    }
+    // Any body whose bounds are not finite (or absurd) would trip the
+    // broadphase's assert and crash: name it and take it out of the world
+    // instead. Cheap: a handful of bodies.
+    {
+        BodyIDVector ids;
+        world->system.GetBodies(ids);
+        const BodyLockInterface &lockInterface = world->system.GetBodyLockInterface();
+        for (const BodyID &id : ids) {
+            AABox bounds;
+            bool soft = false;
+            {
+                BodyLockRead lock(lockInterface, id);
+                if (!lock.Succeeded()) continue;
+                bounds = lock.GetBody().GetWorldSpaceBounds();
+                soft = lock.GetBody().IsSoftBody();
+            }
+            const float limit = 1.0e6f;
+            const bool finite = bounds.mMin.IsNaN() == false && bounds.mMax.IsNaN() == false
+                && bounds.mMin.GetX() > -limit && bounds.mMax.GetX() < limit
+                && bounds.mMin.GetY() > -limit && bounds.mMax.GetY() < limit
+                && bounds.mMin.GetZ() > -limit && bounds.mMax.GetZ() < limit;
+            if (!finite) {
+                fprintf(stderr, "UntoldJoltPhysics: body %u (%s) has non-finite or absurd bounds (%g %g %g – %g %g %g); removing it from the world\n",
+                        id.GetIndexAndSequenceNumber(), soft ? "soft body" : "rigid body",
+                        double(bounds.mMin.GetX()), double(bounds.mMin.GetY()), double(bounds.mMin.GetZ()),
+                        double(bounds.mMax.GetX()), double(bounds.mMax.GetY()), double(bounds.mMax.GetZ()));
+                bi.RemoveBody(id);
+                bi.DestroyBody(id);
+                std::lock_guard<std::mutex> guard(world->recordMutex);
+                world->records.erase(id.GetIndexAndSequenceNumber());
+            }
+        }
     }
     world->system.Update(dt, std::max<int32_t>(collision_steps, 1), world->temp, world->jobs);
 
