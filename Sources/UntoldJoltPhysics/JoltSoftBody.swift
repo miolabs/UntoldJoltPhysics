@@ -51,6 +51,16 @@ public struct JoltSoftBodyDescriptor: Sendable {
     /// Ceiling on a vertex's speed (m/s; 0 = Jolt's default): bounds the
     /// energy a resolved overlap or a yanked pin can put into the body.
     public var maxLinearVelocity: Float = 0
+    /// How bending resists when the constraints come from the faces.
+    public enum BendType: Int32, Sendable {
+        /// The angle between neighbouring triangles: stiffer, and less
+        /// stable when pinned vertices move fast.
+        case dihedral = 0
+        /// A distance across the shared edge: robust.
+        case distance = 1
+    }
+
+    public var bendType: BendType = .dihedral
 
     public init(vertices: [SIMD3<Float>], inverseMasses: [Float], edges: [SIMD2<UInt32>]) {
         self.vertices = vertices
@@ -115,6 +125,7 @@ extension JoltPhysicsBackend {
         desc.shear_compliance = descriptor.shearCompliance
         desc.bend_compliance = descriptor.bendCompliance
         desc.max_linear_velocity = descriptor.maxLinearVelocity
+        desc.bend_type = descriptor.bendType.rawValue
         // Not an engine entity: its activations look like the environment's.
         desc.user_data = UInt64(Self.environmentEntity)
 

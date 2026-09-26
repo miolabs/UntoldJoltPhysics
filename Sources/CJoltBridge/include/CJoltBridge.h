@@ -125,6 +125,10 @@ typedef struct ujolt_soft_body_desc {
     /* Ceiling on a vertex's speed (m/s); <= 0 -> Jolt's default. Bounds the
        energy a resolved overlap or a yanked pin can put into the body. */
     float max_linear_velocity;
+    /* Bend constraints derived from the faces: 0 = dihedral (angle between
+       neighbouring triangles, stiffer, less stable when pins move fast),
+       1 = distance (across the shared edge, robust). */
+    int32_t bend_type;
 } ujolt_soft_body_desc;
 
 typedef enum ujolt_contact_phase {

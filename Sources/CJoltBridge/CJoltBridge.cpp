@@ -524,7 +524,8 @@ ujolt_body_id ujolt_world_add_soft_body(ujolt_world *world, const ujolt_soft_bod
         // the triangles, one attribute set for every vertex.
         if (desc->face_count == 0) return UJOLT_INVALID_BODY;
         const SoftBodySharedSettings::VertexAttributes attributes(desc->compliance, desc->shear_compliance, desc->bend_compliance);
-        shared->CreateConstraints(&attributes, 1, SoftBodySharedSettings::EBendType::Dihedral);
+        const auto bend = desc->bend_type == 1 ? SoftBodySharedSettings::EBendType::Distance : SoftBodySharedSettings::EBendType::Dihedral;
+        shared->CreateConstraints(&attributes, 1, bend);
     } else {
         for (uint32_t i = 0; i < desc->edge_count; ++i) {
             const uint32_t a = desc->edges[i * 2], b = desc->edges[i * 2 + 1];
