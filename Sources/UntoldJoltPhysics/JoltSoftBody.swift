@@ -174,6 +174,8 @@ extension JoltPhysicsBackend {
     public func setSoftBodyVertices(_ body: JoltSoftBody, indices: [UInt32], worldPositions: [SIMD3<Float>]) -> Int {
         let count = min(indices.count, worldPositions.count)
         guard count > 0 else { return 0 }
+        // A non-finite pin would poison the body's bounds next step.
+        guard worldPositions.prefix(count).allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else { return 0 }
         var flat = [Float](repeating: 0, count: count * 3)
         for i in 0 ..< count {
             flat[i * 3] = worldPositions[i].x

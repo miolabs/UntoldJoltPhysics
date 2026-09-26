@@ -49,6 +49,8 @@ public extension JoltPhysicsBackend {
     /// Where the body should be after the next step (applied as a kinematic
     /// move over that step, so it carries the implied velocity).
     func setKinematicTarget(_ body: JoltKinematicBody, position: simd_float3, rotation: simd_quatf) {
+        // A non-finite target would poison the broadphase bounds next step.
+        guard position.x.isFinite, position.y.isFinite, position.z.isFinite, rotation.vector.x.isFinite, rotation.vector.y.isFinite, rotation.vector.z.isFinite, rotation.vector.w.isFinite else { return }
         var p = (position.x, position.y, position.z)
         var r = (rotation.imag.x, rotation.imag.y, rotation.imag.z, rotation.real)
         withUnsafePointer(to: &p) { pp in
@@ -64,6 +66,7 @@ public extension JoltPhysicsBackend {
 
     /// Teleports the body (no implied velocity).
     func setKinematicTransform(_ body: JoltKinematicBody, position: simd_float3, rotation: simd_quatf) {
+        guard position.x.isFinite, position.y.isFinite, position.z.isFinite, rotation.vector.x.isFinite, rotation.vector.y.isFinite, rotation.vector.z.isFinite, rotation.vector.w.isFinite else { return }
         var p = (position.x, position.y, position.z)
         var r = (rotation.imag.x, rotation.imag.y, rotation.imag.z, rotation.real)
         withUnsafePointer(to: &p) { pp in
