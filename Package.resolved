@@ -1,5 +1,5 @@
 {
-  "originHash" : "984c508134850025230911fbb5d42f09da0b70d9e30dcdbd0870d579bc9408b1",
+  "originHash" : "a1f6a6aea1ad04f9375abb9c526ae0688a740319c7ceb98e538fb07c13fbda2b",
   "pins" : [
     {
       "identity" : "joltphysics",
@@ -13,10 +13,10 @@
     {
       "identity" : "untoldengine",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/miolabs/UntoldEngine.git",
+      "location" : "https://github.com/untoldengine/UntoldEngine.git",
       "state" : {
-        "branch" : "feature/mirror_mocap",
-        "revision" : "5b3bcfdaa64b3c52e991ca9c4f09fcba871f3c64"
+        "branch" : "develop",
+        "revision" : "14413aa0a2c023a23d88a493a3fdb00ae32061fd"
       }
     }
   ],
