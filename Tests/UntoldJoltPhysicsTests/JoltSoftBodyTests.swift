@@ -214,6 +214,58 @@ final class JoltSoftBodyTests: XCTestCase {
         backend.removeSoftBody(cloth)
     }
 
+    func testClothCollidesWithAMovedKinematicConvexHull() throws {
+        let backend = makeBackend()
+        let n = 10
+        let spacing: Float = 0.04
+        var vertices: [SIMD3<Float>] = []
+        var inverseMasses: [Float] = []
+        for row in 0 ..< n {
+            for column in 0 ..< n {
+                vertices.append(SIMD3<Float>(Float(column) * spacing - 0.18, 1.2 - Float(row) * spacing, 0))
+                inverseMasses.append(row == 0 ? 0 : 1 / 0.01)
+            }
+        }
+        var faces: [SIMD3<UInt32>] = []
+        for row in 0 ..< n - 1 {
+            for column in 0 ..< n - 1 {
+                let a = UInt32(row * n + column), b = a + 1, c = a + UInt32(n), d = c + 1
+                faces.append(SIMD3(a, c, b))
+                faces.append(SIMD3(b, c, d))
+            }
+        }
+        var descriptor = JoltSoftBodyDescriptor(
+            vertices: vertices, inverseMasses: inverseMasses, faces: faces,
+            compliance: 1e-6, shearCompliance: 1e-5, bendCompliance: 1e-3
+        )
+        descriptor.vertexRadius = 0.01
+        let cloth = try XCTUnwrap(backend.addSoftBody(descriptor))
+        // A wedge (a box with a squashed top) behind the sheet, moved forward through its plane.
+        var points: [simd_float3] = []
+        for x: Float in [-0.25, 0.25] {
+            for z: Float in [-0.05, 0.05] {
+                points.append(simd_float3(x, -0.05, z))
+                points.append(simd_float3(x * 0.6, 0.05, z * 0.6))
+            }
+        }
+        XCTAssertNil(backend.addKinematicConvexHull(points: [simd_float3(0, 0, 0), simd_float3(1, 0, 0), simd_float3(0, 1, 0)], position: .zero, rotation: simd_quatf(angle: 0, axis: simd_float3(0, 1, 0))), "three points are no hull")
+        let hull = try XCTUnwrap(backend.addKinematicConvexHull(points: points, position: SIMD3<Float>(0, 1.0, -0.2), rotation: simd_quatf(angle: 0, axis: simd_float3(0, 1, 0))))
+        advance(backend, seconds: 0.5)
+        for frame in 0 ..< 90 {
+            let z = -0.2 + 0.4 * Float(frame) / 90
+            backend.setKinematicTarget(hull, position: SIMD3<Float>(0, 1.0, z), rotation: simd_quatf(angle: 0, axis: simd_float3(0, 1, 0)))
+            backend.step(deltaTime: step)
+        }
+        var positions: [SIMD3<Float>] = []
+        backend.readSoftBodyVertices(cloth, into: &positions)
+        XCTAssertTrue(positions.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite })
+        let rowAtHull = 5
+        let pushed = positions[rowAtHull * n + n / 2].z
+        XCTAssertGreaterThan(pushed, 0.12, "cloth pushed in front of the hull, at z \(pushed)")
+        backend.removeKinematicBody(hull)
+        backend.removeSoftBody(cloth)
+    }
+
     func testRemovedSoftBodyStopsExisting() throws {
         let backend = makeBackend()
         let body = try XCTUnwrap(backend.addSoftBody(sheet(n: 3, spacing: 0.1, y: 1.0)))

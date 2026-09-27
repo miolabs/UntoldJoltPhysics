@@ -2,10 +2,10 @@
 //  JoltKinematicBody.swift
 //  UntoldJoltPhysics
 //
-//  Kinematic colliders that are not engine entities: a capsule per bone of
-//  an animated character, moved every frame to follow the skeleton, for
-//  cloth and other soft bodies to collide with. Same side channel as the
-//  soft bodies.
+//  Kinematic colliders that are not engine entities: a capsule or a convex
+//  hull per bone of an animated character, moved every frame to follow the
+//  skeleton, for cloth and other soft bodies to collide with. Same side
+//  channel as the soft bodies.
 //
 
 import CJoltBridge
@@ -44,6 +44,39 @@ public extension JoltPhysicsBackend {
         let id = ujolt_world_add_body(worldHandle, &desc)
         guard id != UJOLT_INVALID_BODY else { return nil }
         return JoltKinematicBody(id: id)
+    }
+
+    /// Adds a kinematic convex hull of `points` (body-local; at least four
+    /// not all coplanar, a few dozen at most is plenty). Frame thread.
+    func addKinematicConvexHull(
+        points: [simd_float3], position: simd_float3, rotation: simd_quatf,
+        friction: Float = 0.5, layer: UInt32 = 0
+    ) -> JoltKinematicBody? {
+        guard points.count >= 4, points.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else { return nil }
+        var flat: [Float] = []
+        flat.reserveCapacity(points.count * 3)
+        for p in points {
+            flat.append(p.x)
+            flat.append(p.y)
+            flat.append(p.z)
+        }
+        return flat.withUnsafeBufferPointer { buffer -> JoltKinematicBody? in
+            var desc = ujolt_body_desc()
+            desc.shape = UJOLT_SHAPE_CONVEX_HULL
+            desc.hull_points = buffer.baseAddress
+            desc.hull_point_count = UInt32(points.count)
+            desc.friction = friction
+            desc.restitution = 0
+            desc.motion = UJOLT_MOTION_KINEMATIC
+            desc.gravity_factor = 0
+            desc.layer = layer
+            desc.position = (position.x, position.y, position.z)
+            desc.rotation = (rotation.imag.x, rotation.imag.y, rotation.imag.z, rotation.real)
+            desc.user_data = UInt64(Self.environmentEntity)
+            let id = ujolt_world_add_body(worldHandle, &desc)
+            guard id != UJOLT_INVALID_BODY else { return nil }
+            return JoltKinematicBody(id: id)
+        }
     }
 
     /// Where the body should be after the next step (applied as a kinematic
