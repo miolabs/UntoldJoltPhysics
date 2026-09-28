@@ -29,7 +29,7 @@ let package = Package(
         .package(url: "https://github.com/untoldengine/JoltPhysics.git", exact: "5.6.0-spm.1"),
         // On this branch the plugin builds against the fork's deformation branch,
         // which CoolMirror (its consumer for the cape cloth) depends on.
-        .package(url: "https://github.com/miolabs/UntoldEngine.git", branch: "feature/mirror_mocap"),
+        .package(url: "https://github.com/miolabs/UntoldEngine.git", branch: "feature/mirror_reach_ik"),
     ],
     targets: [
         // C ABI shim over the Jolt C++ API: opaque handles and plain structs,
