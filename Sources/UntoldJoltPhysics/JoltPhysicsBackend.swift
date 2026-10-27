@@ -209,8 +209,13 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
         desc.position = (descriptor.position.x, descriptor.position.y, descriptor.position.z)
         let q = descriptor.orientation
         desc.rotation = (q.imag.x, q.imag.y, q.imag.z, q.real)
-        desc.linear_velocity = (descriptor.linearVelocity.x, descriptor.linearVelocity.y, descriptor.linearVelocity.z)
-        desc.angular_velocity = (descriptor.angularVelocity.x, descriptor.angularVelocity.y, descriptor.angularVelocity.z)
+        // Jolt asserts on a body created with a velocity that is not a
+        // number (and a release build would carry the NaN into the
+        // simulation): such a body starts at rest instead.
+        let linear = descriptor.linearVelocity, angular = descriptor.angularVelocity
+        let finite = { (v: simd_float3) in v.x.isFinite && v.y.isFinite && v.z.isFinite }
+        desc.linear_velocity = finite(linear) ? (linear.x, linear.y, linear.z) : (0, 0, 0)
+        desc.angular_velocity = finite(angular) ? (angular.x, angular.y, angular.z) : (0, 0, 0)
         desc.user_data = UInt64(entity)
 
         let body: ujolt_body_id = hullPoints.withUnsafeBufferPointer { points in
