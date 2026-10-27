@@ -77,7 +77,11 @@ built against, as the engine's validator demands.
 - **Layers.** The engine's `layer` (0…31) maps to a Jolt object layer; the
   world configuration's `collisionLayerMatrix` (`masks[i]` = layers that layer
   `i` collides with, symmetrised) drives Jolt's pair filter. Static bodies never
-  collide with each other. Per-body `collisionMask` is not consulted yet.
+  collide with each other. Per-body `collisionMask` is not consulted yet. A
+  changed matrix applies to the bodies already in the world and wakes every
+  one of them: Jolt pairs active bodies only, so a body asleep on a surface
+  the new matrix hides from it would otherwise rest on it until something
+  else woke it.
 - **Contact events** follow the engine's reference backend: `entityA` is the
   dynamic body (the second body when both or neither are) and the normal points
   out of `entityB` into `entityA`. The impulse in `.began` events is an estimate
@@ -105,6 +109,9 @@ built against, as the engine's validator demands.
   for detected real-world surfaces; contacts and ray hits on them carry
   `JoltPhysicsBackend.environmentEntity` (the engine's null entity). Re-sent
   boxes that did not change keep their Jolt bodies, so resting balls stay put.
+  Each box sits on an engine collision layer (`layer`, 0 by default) that the
+  layer matrix filters like any body's, so a surface can be kept from a
+  chosen set of bodies — a room a tracked ragdoll reaches through.
 - **Restitution/friction** combine with Jolt's defaults (max / geometric mean).
 - **Soft bodies** (`JoltPhysicsBackend.addSoftBody` / `readSoftBodyVertices` /
   `removeSoftBody`, a side channel like `resetBody`): particles joined by
