@@ -9,10 +9,11 @@ import UntoldEngine
 @testable import UntoldJoltPhysics
 import XCTest
 
-/// A sheet skinned to two joints: hard skinning, following moving joints,
-/// the back-stop, hard-skinned vertices inside a collider, teleport resets,
-/// one-way contact against a ragdoll part, the skin parameters, the
-/// normals read-back, sleep control and the demo's 100 Hz cadence.
+/// A sheet skinned to two joints: hard skinning, a step before the first
+/// feed, following moving joints, the back-stop, hard-skinned vertices
+/// inside a collider, teleport resets, malformed skins, one-way contact
+/// against a ragdoll part, the skin parameters, the normals read-back,
+/// sleep control and the demo's 100 Hz cadence.
 final class JoltSoftBodySkinnedTests: XCTestCase {
     private let step: Float = 1.0 / 60.0
     private let step100: Float = 1.0 / 100.0
@@ -217,6 +218,28 @@ final class JoltSoftBodySkinnedTests: XCTestCase {
         XCTAssertLessThan(farthest(p, from: cpuSkin(shifted)), 1e-3, "the first feed placed every vertex on the pose")
     }
 
+    /// Jolt starts the skin state as NaN and runs the skin constraints from
+    /// the body's first step, so a body stepped before its first feed — one
+    /// added after this frame's `willStep`, say — would dissolve unless the
+    /// bridge created it skinned to its bind pose. That priming must not
+    /// count as the first feed, which stays a hard skin.
+    func testSkinnedBodySurvivesAStepBeforeItsFirstFeed() throws {
+        let backend = makeBackend()
+        let body = try XCTUnwrap(backend.addSoftBody(sheet(gravityFactor: 0)))
+        backend.step(deltaTime: step)
+        var p = positions(backend, body)
+        XCTAssertTrue(allFinite(p), "an unfed body is still a body")
+        let bind = cpuSkin(bindPose)
+        XCTAssertLessThan(farthest(p, from: bind, rows: 0 ..< 1), 1e-4, "the hard row sits on its bind pose")
+        XCTAssertLessThan(farthest(p, from: bind), 1e-3, "and so, at rest without gravity, does the rest")
+        let shifted = pose(offset: SIMD3<Float>(0.1, 0.05, -0.02))
+        XCTAssertTrue(backend.skinSoftBody(body, jointWorldMatrices: shifted))
+        backend.step(deltaTime: step)
+        p = positions(backend, body)
+        XCTAssertTrue(allFinite(p))
+        XCTAssertLessThan(farthest(p, from: cpuSkin(shifted)), 1e-3, "the first real feed is still a hard skin")
+    }
+
     func testSkinnedSheetFollowsMovingJoints() throws {
         let backend = makeBackend()
         let body = try XCTUnwrap(backend.addSoftBody(sheet()))
@@ -304,6 +327,70 @@ final class JoltSoftBodySkinnedTests: XCTestCase {
         let p = positions(backend, body)
         XCTAssertTrue(allFinite(p))
         XCTAssertLessThan(farthest(p, from: targets), 0.001, "every vertex is on the new pose")
+    }
+
+    /// Two triangles at the fixture's height, wound for +Y, the given
+    /// vertices skinned to one joint with 5 cm of slack and the given
+    /// back-stop.
+    private func twoTriangles(skinned: [UInt32], backstop: Float) -> JoltSoftBodyDescriptor {
+        var descriptor = JoltSoftBodyDescriptor(
+            vertices: [SIMD3<Float>(0, 0, 0), SIMD3<Float>(0.05, 0, 0), SIMD3<Float>(0, 0, 0.05), SIMD3<Float>(0.05, 0, 0.05)],
+            inverseMasses: [50, 50, 50, 50], faces: [SIMD3(0, 2, 1), SIMD3(1, 2, 3)],
+            compliance: 1e-6, shearCompliance: 1e-5, bendCompliance: 1e-3
+        )
+        descriptor.position = origin
+        descriptor.skin = JoltSoftBodySkin(bindJointWorldMatrices: [bindPose[0]], vertices: skinned.map { vertex in
+            var v = JoltSoftBodySkinnedVertex(vertex: vertex, influences: [JoltSoftBodySkinInfluence(joint: 0, weight: 1)], maxDistance: 0.05)
+            v.backstopDistance = backstop
+            return v
+        })
+        return descriptor
+    }
+
+    /// The documented refusals: a skin without faces, a vertex pulled by no
+    /// joint, by five or by a joint the skin does not have, a back-stop on
+    /// a vertex with no face whose three vertices are all skinned, a
+    /// multiplier that is not finite and a feed with a matrix that is not.
+    func testMalformedSkinIsRefused() throws {
+        let backend = makeBackend()
+        var noFaces = sheet()
+        noFaces.faces = []
+        XCTAssertNil(backend.addSoftBody(noFaces), "a skin needs faces")
+        var noJoint = sheet()
+        noJoint.skin!.vertices[5].influences = []
+        XCTAssertNil(backend.addSoftBody(noJoint), "a vertex pulled by no joint")
+        var fiveJoints = sheet()
+        fiveJoints.skin!.vertices[5].influences = Array(repeating: JoltSoftBodySkinInfluence(joint: 0, weight: 0.2), count: 5)
+        XCTAssertNil(backend.addSoftBody(fiveJoints), "Jolt takes four joints at most")
+        var unknownJoint = sheet()
+        unknownJoint.skin!.vertices[5].influences[0].joint = 2
+        XCTAssertNil(backend.addSoftBody(unknownJoint), "the skin has two joints")
+
+        // No face of the pair has three skinned vertices, so a back-stop on
+        // either skinned vertex has no normal to lie behind.
+        XCTAssertNil(backend.addSoftBody(twoTriangles(skinned: [0, 1], backstop: 0.01)), "a back-stop needs a fully skinned face")
+        XCTAssertNotNil(backend.addSoftBody(twoTriangles(skinned: [0, 1], backstop: .greatestFiniteMagnitude)), "without the back-stop the same skin is fine")
+        XCTAssertNotNil(backend.addSoftBody(twoTriangles(skinned: [0, 1, 2, 3], backstop: 0.01)), "as is the back-stop once a face is fully skinned")
+
+        // A NaN multiplier applies nothing: std::max would have made it 0
+        // and hard skinned the whole sheet onto its skin.
+        let hanging = try XCTUnwrap(backend.addSoftBody(sheet()))
+        backend.skinSoftBody(hanging, jointWorldMatrices: bindPose, hardSkinAll: true)
+        advance(backend, seconds: 0.5) { backend.skinSoftBody(hanging, jointWorldMatrices: self.bindPose) }
+        backend.setSoftBodySkin(hanging, maxDistanceMultiplier: .nan)
+        backend.skinSoftBody(hanging, jointWorldMatrices: bindPose)
+        backend.step(deltaTime: step)
+        XCTAssertGreaterThan(farthest(positions(backend, hanging), from: cpuSkin(bindPose), rows: 1 ..< rows), 0.003, "the free rows still hang on the back-stop")
+
+        // A feed with a NaN in it applies nothing and the body is unharmed.
+        let body = try XCTUnwrap(backend.addSoftBody(sheet(gravityFactor: 0)))
+        var bad = bindPose
+        bad[1].columns.3.x = .nan
+        XCTAssertFalse(backend.skinSoftBody(body, jointWorldMatrices: bad), "a non-finite matrix is refused")
+        backend.step(deltaTime: step)
+        let p = positions(backend, body)
+        XCTAssertTrue(allFinite(p))
+        XCTAssertLessThan(farthest(p, from: cpuSkin(bindPose)), 1e-3, "and nothing of it was applied")
     }
 
     // MARK: Ragdoll parts
@@ -434,13 +521,18 @@ final class JoltSoftBodySkinnedTests: XCTestCase {
         backend.skinSoftBody(body, jointWorldMatrices: bindPose)
         backend.step(deltaTime: step)
         XCTAssertLessThan(farthest(positions(backend, body), from: targets), 1e-3, "every vertex is pulled onto its skin")
-        // Switched off, only the hard row still follows; the rest hangs free.
+        // Switched off, only the hard row still follows the skin: joints
+        // moved 10 cm take it along (Jolt hard skins the kinematic vertices
+        // at feed time when it will not solve the constraints) and leave
+        // the rest hanging free.
         backend.setSoftBodySkin(body, maxDistanceMultiplier: 1, enabled: false)
-        advance(backend, seconds: 1) { backend.skinSoftBody(body, jointWorldMatrices: self.bindPose) }
+        let moved = pose(offset: SIMD3<Float>(0.1, 0, 0))
+        let movedTargets = cpuSkin(moved)
+        advance(backend, seconds: 1) { backend.skinSoftBody(body, jointWorldMatrices: moved) }
         let p = positions(backend, body)
         XCTAssertTrue(allFinite(p))
-        XCTAssertGreaterThan(farthest(p, from: targets, rows: 1 ..< rows), maxDistance, "the free rows sag past their slack")
-        XCTAssertLessThan(farthest(p, from: targets, rows: 0 ..< 1), 1e-4, "the hard row stays")
+        XCTAssertLessThan(farthest(p, from: movedTargets, rows: 0 ..< 1), 1e-4, "the hard row follows the joints without the constraints")
+        XCTAssertGreaterThan(farthest(p, from: movedTargets, rows: 1 ..< rows), maxDistance, "the free rows sag past their slack")
     }
 
     func testReadbackNormalsAreUnitAndPositionsMatchTheOldCall() throws {
@@ -477,9 +569,11 @@ final class JoltSoftBodySkinnedTests: XCTestCase {
 
     /// The demo's cadence, one skin feed per step: the joints swing
     /// x = 0.2 sin(2πt) at 100 Hz for 3 s, with three Jolt sub-steps and
-    /// with one. Printed for tuning; asserted loosely: Jolt solves the
-    /// stretch edges after the skin clamp within an iteration, so a fast
-    /// swing leaves a vertex a few millimetres past its slack at read-back.
+    /// with one. Printed for tuning and bounded: the worst vertex loosely,
+    /// since Jolt solves the stretch edges after the skin clamp within an
+    /// iteration and a fast swing leaves a vertex a few millimetres past
+    /// its slack at read-back; the RMS tracking error with a third over
+    /// what was measured (19 and 26 mm), so a regression doubling it shows.
     func testOneSkinPerUpdateCadence() throws {
         func run(collisionSteps: Int32) throws -> (rms: Float, peakSpeed: Float, worst: Float) {
             let backend = makeBackend(collisionSteps: collisionSteps)
@@ -512,6 +606,7 @@ final class JoltSoftBodySkinnedTests: XCTestCase {
         for substeps: Int32 in [3, 1] {
             let result = try run(collisionSteps: substeps)
             XCTAssertLessThan(result.worst, maxDistance + 0.005, "\(substeps) sub-steps: a vertex strayed \(result.worst) m from its skin")
+            XCTAssertLessThan(result.rms, 0.035, "\(substeps) sub-steps: RMS vertex-to-target \(result.rms) m")
             print("skin cadence: 100 Hz, \(substeps) sub-step(s) -> RMS vertex-to-target \(result.rms) m, peak particle speed \(result.peakSpeed) m/s")
         }
     }

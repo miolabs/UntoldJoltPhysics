@@ -41,7 +41,10 @@ public struct JoltSoftBodySkinnedVertex: Sendable {
     public var maxDistance: Float
     /// The back-stop sphere starts this far behind the skinned position,
     /// against the skin's normal, and keeps the particle outside the body
-    /// the cloth is worn over. Disabled unless it is below `maxDistance`.
+    /// the cloth is worn over. Disabled unless it is below `maxDistance`
+    /// (times the multiplier `setSoftBodySkin` sets). The normal comes from
+    /// the faces around the vertex whose three vertices are all skinned, so
+    /// a back-stopped vertex needs one or `addSoftBody` refuses the body.
     public var backstopDistance: Float = .greatestFiniteMagnitude
     /// Radius of that sphere; 40 m approximates a plane.
     public var backstopRadius: Float = 40
@@ -80,6 +83,9 @@ public struct JoltSoftBodyDescriptor: Sendable {
     public var edgeCompliances: [Float]? = nil
     /// Optional triangles: with them the body has a surface, so a sphere
     /// cannot slip between particles (and continuous collision applies).
+    /// For a skinned body, wind them counter-clockwise seen from outside
+    /// the cloth: their normal is the skin's, and the back-stop lies behind
+    /// it, inside the body the cloth is worn over.
     public var faces: [SIMD3<UInt32>] = []
     public var position: SIMD3<Float> = .zero
     public var layer: UInt32 = 0
@@ -117,15 +123,21 @@ public struct JoltSoftBodyDescriptor: Sendable {
     public var bendType: BendType = .dihedral
     /// Skinning to a skeleton; needs `faces` (the back-stop normals come
     /// from them). The game then feeds the joints before every step with
-    /// `JoltPhysicsBackend.skinSoftBody`.
+    /// `JoltPhysicsBackend.skinSoftBody`; the body is created skinned to
+    /// its bind pose, so a step before the first feed is sound.
     public var skin: JoltSoftBodySkin? = nil
     /// Whether Jolt may put the body to sleep at rest (its default). Jolt
     /// never wakes a body for its skin, so cloth on a live character
     /// passes false rather than rely on every feed waking it.
     public var allowSleeping = true
-    /// Ragdoll parts push this body and it never pushes them: a moving arm
-    /// drags the cloth along by friction while receiving nothing back.
-    /// Every other body collides both ways.
+    /// Ragdoll parts push this body and it never pushes them: a swinging
+    /// dynamic arm drags the cloth along by friction while receiving nothing
+    /// back, a kinematic (animated) part only pushes. Every other body
+    /// collides both ways. The one gap is Jolt's continuous collision: a
+    /// dynamic part moving more than three quarters of its inner radius in
+    /// a sub-step is still held at the cloth for that sub-step (no impulse,
+    /// but the rest of its travel that sub-step is lost); raise
+    /// `collisionSteps` or turn `continuousCollision` off if it shows.
     public var oneWayAgainstRagdolls = false
 
     public init(vertices: [SIMD3<Float>], inverseMasses: [Float], edges: [SIMD2<UInt32>]) {
@@ -180,8 +192,9 @@ private func translation(_ offset: SIMD3<Float>) -> simd_float4x4 {
 extension JoltPhysicsBackend {
     /// Adds a soft body; nil if the descriptor is malformed (an edge or face
     /// index out of range, a zero-length edge, a skin without faces or
-    /// joints, a skinned vertex pulled by no joint or by more than four).
-    /// Frame thread.
+    /// joints, a skinned vertex pulled by no joint, by more than four or by
+    /// a joint the skin does not have, a back-stopped vertex with no face
+    /// whose three vertices are all skinned). Frame thread.
     public func addSoftBody(_ descriptor: JoltSoftBodyDescriptor) -> JoltSoftBody? {
         guard !descriptor.vertices.isEmpty, descriptor.inverseMasses.count == descriptor.vertices.count else { return nil }
         var positions: [Float] = []
@@ -369,10 +382,11 @@ extension JoltPhysicsBackend {
     }
 
     /// Scales every skinned vertex's `maxDistance` (0 hard skins the whole
-    /// body to its skin; 1 restores the descriptor's) and switches the skin
-    /// constraints on or off (off, only the hard-skinned vertices still
-    /// follow the skin and the rest hangs free). Frame thread, between
-    /// steps.
+    /// body to its skin; 1 restores the descriptor's; below a vertex's
+    /// `backstopDistance / maxDistance` its back-stop is off) and switches
+    /// the skin constraints on or off (off, only the hard-skinned vertices
+    /// still follow the skin and the rest hangs free). A non-finite
+    /// multiplier applies nothing. Frame thread, between steps.
     public func setSoftBodySkin(_ body: JoltSoftBody, maxDistanceMultiplier: Float, enabled: Bool = true) {
         ujolt_world_set_soft_body_skin_params(worldHandle, body.id, maxDistanceMultiplier, enabled ? 1 : 0)
     }
