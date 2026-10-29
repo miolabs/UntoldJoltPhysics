@@ -118,6 +118,12 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
     private var contactScratch: [ujolt_contact_event]
     private var activationScratch: [ujolt_activation_event]
 
+    /// Called at the top of every `step`, with the step's delta, after the
+    /// pending environment is applied and before Jolt runs: where a game
+    /// pushes this frame's joints into its skinned soft bodies
+    /// (`skinSoftBody`), which must happen between steps. Frame thread.
+    public var willStep: ((Float) -> Void)?
+
     public init(settings: JoltWorldSettings = JoltWorldSettings()) {
         collisionSteps = max(settings.collisionSteps, 1)
         self.settings = settings
@@ -277,6 +283,7 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
 
     public func step(deltaTime: Float) {
         applyPendingEnvironment()
+        willStep?(deltaTime)
         ujolt_world_step(world, deltaTime, collisionSteps)
     }
 

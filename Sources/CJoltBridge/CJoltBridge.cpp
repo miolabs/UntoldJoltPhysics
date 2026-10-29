@@ -36,7 +36,9 @@
 #include <Jolt/Physics/PhysicsSettings.h>
 #include <Jolt/Physics/Ragdoll/Ragdoll.h>
 #include <Jolt/Physics/Collision/GroupFilterTable.h>
+#include <Jolt/Physics/SoftBody/SoftBodyContactListener.h>
 #include <Jolt/Physics/SoftBody/SoftBodyCreationSettings.h>
+#include <Jolt/Physics/SoftBody/SoftBodyManifold.h>
 #include <Jolt/Physics/SoftBody/SoftBodyMotionProperties.h>
 #include <Jolt/Physics/SoftBody/SoftBodySharedSettings.h>
 #include <Jolt/Physics/PhysicsSystem.h>
@@ -205,7 +207,7 @@ struct ujolt_ragdoll {
     bool active = false;
 };
 
-struct ujolt_world final : public ContactListener, public BodyActivationListener {
+struct ujolt_world final : public ContactListener, public BodyActivationListener, public SoftBodyContactListener {
     ujolt_world(const ujolt_world_desc &desc)
         : bpInterface(kObjectLayers, kBPLayers),
           pairFilter(kObjectLayers),
@@ -239,11 +241,15 @@ struct ujolt_world final : public ContactListener, public BodyActivationListener
         system.SetGravity(v3(desc.gravity));
         system.SetContactListener(this);
         system.SetBodyActivationListener(this);
+        system.SetSoftBodyContactListener(this);
+        softBodyOneWay.assign(maxBodies, 0);
+        softBodySkinFed.assign(maxBodies, 0);
     }
 
     ~ujolt_world() override {
         system.SetContactListener(nullptr);
         system.SetBodyActivationListener(nullptr);
+        system.SetSoftBodyContactListener(nullptr);
         // Characters own their inner bodies (the CharacterVirtual destructor
         // removes and destroys them): release them before the body sweep
         // below, and while the PhysicsSystem is still alive.
@@ -455,6 +461,27 @@ struct ujolt_world final : public ContactListener, public BodyActivationListener
         deactivatedThisStep.push_back(id);
     }
 
+    // MARK: SoftBodyContactListener (Jolt worker threads, every body locked)
+
+    /// A one-way soft body takes the push of a ragdoll part and never
+    /// pushes back: the part's inverse mass and inertia are scaled to 0 for
+    /// the contact, so Jolt still reads the part's point velocity in the
+    /// response (a moving arm drags the cloth along by friction) while the
+    /// impulse it would receive is zero; a kinematic part only pushes. In
+    /// this bridge only ragdoll parts carry a collision group (CreateRagdoll
+    /// gives each ragdoll its own; ujolt_world_add_body never sets one),
+    /// which is the lock-free test the callback demands — every body is
+    /// locked while it runs, so nothing here may lock or look a record up.
+    SoftBodyValidateResult OnSoftBodyContactValidate(const Body &soft, const Body &other, SoftBodyContactSettings &settings) override {
+        const uint32_t index = soft.GetID().GetIndex();
+        if (index < softBodyOneWay.size() && softBodyOneWay[index] != 0
+            && other.GetCollisionGroup().GetGroupID() != CollisionGroup::cInvalidGroup) {
+            settings.mInvMassScale2 = 0.0f;
+            settings.mInvInertiaScale2 = 0.0f;
+        }
+        return SoftBodyValidateResult::AcceptContact;
+    }
+
     // MARK: State
 
     TempAllocatorImpl *temp = nullptr;
@@ -476,6 +503,19 @@ struct ujolt_world final : public ContactListener, public BodyActivationListener
     std::vector<uint32_t> removedSinceLastStep;
 
     std::vector<KinematicTarget> kinematicTargets;
+    /// Per body index (BodyID::GetIndex), whether the soft body there is
+    /// one-way against ragdoll parts. Written on the frame thread only, by
+    /// add and remove between steps — never during Update — and read
+    /// without a lock from the validate callback on Jolt's workers.
+    std::vector<uint8_t> softBodyOneWay;
+    /// Per body index, whether the soft body there has had a skin feed yet.
+    /// Jolt blends each iteration's skinned position from the previous
+    /// feed's, and before the first feed there is none (a NaN), so the
+    /// first feed is always a hard skin. Frame thread only.
+    std::vector<uint8_t> softBodySkinFed;
+    /// The joints of one skin feed made relative to the body's centre of
+    /// mass; kept so a feed allocates nothing.
+    std::vector<Mat44> skinScratch;
     std::unordered_set<ujolt_character *> characters;
     std::unordered_set<ujolt_ragdoll *> ragdolls;
     /// Jolt's collision group per ragdoll (parent/child pairs are filtered
@@ -693,9 +733,40 @@ ujolt_body_id ujolt_world_add_soft_body(ujolt_world *world, const ujolt_soft_bod
         }
         shared->CalculateEdgeLengths();
     }
+    if (desc->skinned_count > 0) {
+        // The back-stop normals come from the faces, so a skin needs them.
+        if (desc->face_count == 0 || desc->joint_count == 0 || desc->inv_bind == nullptr || desc->skinned == nullptr) return UJOLT_INVALID_BODY;
+        for (uint32_t j = 0; j < desc->joint_count; ++j) {
+            shared->mInvBindMatrices.push_back(SoftBodySharedSettings::InvBind(j, mat44(desc->inv_bind + j * 16)));
+        }
+        for (uint32_t i = 0; i < desc->skinned_count; ++i) {
+            const ujolt_soft_body_skin_vertex &sv = desc->skinned[i];
+            // A vertex no joint pulls on would be skinned to the origin.
+            if (sv.vertex >= desc->vertex_count || !(std::isfinite(sv.weights[0]) && sv.weights[0] > 0.0f)) return UJOLT_INVALID_BODY;
+            SoftBodySharedSettings::Skinned skinned(sv.vertex, sv.max_distance, sv.backstop_distance, sv.backstop_radius);
+            // Jolt reads the weights up to the first zero.
+            for (uint32_t k = 0; k < SoftBodySharedSettings::Skinned::cMaxSkinWeights && sv.weights[k] > 0.0f; ++k) {
+                if (sv.joints[k] >= desc->joint_count) return UJOLT_INVALID_BODY;
+                skinned.mWeights[k] = SoftBodySharedSettings::SkinWeight(sv.joints[k], sv.weights[k]);
+            }
+            skinned.NormalizeWeights();
+            shared->mSkinnedConstraints.push_back(skinned);
+            // A hard-skinned vertex is placed by the skin every iteration.
+            // Jolt runs the skin constraints before collision and skips the
+            // collision response for vertices without mass, so with mass a
+            // vertex inside a forearm capsule would be pushed out and re-set
+            // every iteration, jittering; without, it is simply where the
+            // skin puts it.
+            if (sv.max_distance == 0.0f) shared->mVertices[sv.vertex].mInvMass = 0.0f;
+        }
+        // Before Optimize, which reorders the constraints (Jolt's
+        // SoftBodySkinnedConstraintTest does it in this order).
+        shared->CalculateSkinnedConstraintNormals();
+    }
     shared->Optimize();
 
     SoftBodyCreationSettings settings(shared, RVec3(v3(desc->position)), Quat::sIdentity(), objectLayer(desc->layer, true));
+    settings.mAllowSleeping = desc->allow_sleeping != 0;
     settings.mUserData = desc->user_data;
     if (desc->iterations > 0) settings.mNumIterations = desc->iterations;
     settings.mLinearDamping = desc->linear_damping;
@@ -717,6 +788,9 @@ ujolt_body_id ujolt_world_add_soft_body(ujolt_world *world, const ujolt_soft_bod
         record.soft = true;
         world->records[id.GetIndexAndSequenceNumber()] = record;
     }
+    if (id.GetIndex() < world->softBodyOneWay.size()) {
+        world->softBodyOneWay[id.GetIndex()] = desc->one_way_against_ragdolls != 0 ? 1 : 0;
+    }
     world->broadPhaseDirty = true;
     return id.GetIndexAndSequenceNumber();
 }
@@ -729,6 +803,10 @@ uint32_t ujolt_world_soft_body_vertex_count(ujolt_world *world, ujolt_body_id bo
 }
 
 uint32_t ujolt_world_read_soft_body_vertices(ujolt_world *world, ujolt_body_id body, float *positions, uint32_t capacity) {
+    return ujolt_world_read_soft_body_vertices_and_normals(world, body, positions, nullptr, capacity);
+}
+
+uint32_t ujolt_world_read_soft_body_vertices_and_normals(ujolt_world *world, ujolt_body_id body, float *positions, float *normals, uint32_t capacity) {
     BodyLockRead lock(world->system.GetBodyLockInterface(), BodyID(body));
     if (!lock.Succeeded() || !lock.GetBody().IsSoftBody()) return 0;
     const Body &b = lock.GetBody();
@@ -742,6 +820,32 @@ uint32_t ujolt_world_read_soft_body_vertices(ujolt_world *world, ujolt_body_id b
         positions[i * 3] = float(w.GetX());
         positions[i * 3 + 1] = float(w.GetY());
         positions[i * 3 + 2] = float(w.GetZ());
+    }
+    if (normals == nullptr || count == 0) return count;
+    // Face normals, area-weighted (the unnormalised cross product), summed
+    // on each face's vertices in the body's frame; a face reaching past
+    // the vertices written is left out.
+    std::fill(normals, normals + size_t(count) * 3, 0.0f);
+    for (const SoftBodySharedSettings::Face &face : mp->GetFaces()) {
+        const uint32_t i0 = face.mVertex[0], i1 = face.mVertex[1], i2 = face.mVertex[2];
+        if (i0 >= count || i1 >= count || i2 >= count) continue;
+        const Vec3 p0 = vertices[i0].mPosition;
+        const Vec3 n = (vertices[i1].mPosition - p0).Cross(vertices[i2].mPosition - p0);
+        for (uint32_t i : {i0, i1, i2}) {
+            float *out = normals + i * 3;
+            out[0] += n.GetX();
+            out[1] += n.GetY();
+            out[2] += n.GetZ();
+        }
+    }
+    // The body's rotation is the identity in this bridge
+    // (mMakeRotationIdentity, mUpdatePosition off); applied anyway so the
+    // normals stay right should that change. A vertex on no face, or on
+    // degenerate ones, gets +Y rather than a NaN.
+    const Mat44 rotation = com.GetRotation();
+    for (uint32_t i = 0; i < count; ++i) {
+        float *out = normals + i * 3;
+        store3(out, rotation.Multiply3x3(Vec3(out[0], out[1], out[2])).NormalizedOr(Vec3::sAxisY()));
     }
     return count;
 }
@@ -771,6 +875,57 @@ uint32_t ujolt_world_set_soft_body_vertices(ujolt_world *world, ujolt_body_id bo
     return applied;
 }
 
+int32_t ujolt_world_skin_soft_body(ujolt_world *world, ujolt_body_id body, const float *joint_world_matrices, uint32_t joint_count, int32_t hard_skin_all) {
+    if (joint_world_matrices == nullptr || joint_count == 0) return 0;
+    // One bad matrix would skin a vertex to NaN and poison the body's
+    // bounds: nothing is applied unless every value is sound.
+    for (uint32_t i = 0; i < joint_count * 16; ++i) {
+        if (!std::isfinite(joint_world_matrices[i])) return 0;
+    }
+    BodyLockWrite lock(world->system.GetBodyLockInterface(), BodyID(body));
+    if (!lock.Succeeded() || !lock.GetBody().IsSoftBody()) return 0;
+    Body &b = lock.GetBody();
+    auto *mp = static_cast<SoftBodyMotionProperties *>(b.GetMotionProperties());
+    const SoftBodySharedSettings &shared = *mp->GetSettings();
+    if (shared.mSkinnedConstraints.empty()) return 0;
+    // Jolt indexes the matrices by the skin's joint indices without a check.
+    for (const SoftBodySharedSettings::InvBind &invBind : shared.mInvBindMatrices) {
+        if (invBind.mJointIndex >= joint_count) return 0;
+    }
+    // Jolt wants the joints relative to the body's centre of mass; Mat44's
+    // columns are laid out like simd_float4x4's.
+    const RMat44 com = b.GetCenterOfMassTransform();
+    const Mat44 offset = com.InversedRotationTranslation().ToMat44();
+    world->skinScratch.resize(joint_count);
+    for (uint32_t j = 0; j < joint_count; ++j) {
+        world->skinScratch[j] = offset * mat44(joint_world_matrices + j * 16);
+    }
+    // The first feed is a hard skin whatever the caller asked: Jolt blends
+    // the skinned positions from the previous feed's over its iterations,
+    // and before the first there is none, only a NaN that would poison the
+    // body (Jolt's own sample hard skins first for the same reason).
+    const uint32_t index = b.GetID().GetIndex();
+    const bool fedBefore = index < world->softBodySkinFed.size() && world->softBodySkinFed[index] != 0;
+    // The frame thread between steps is the only caller, so the world's
+    // temp allocator (a LIFO stack that Jolt's update also uses) is free.
+    // Hard skinning happens here and nowhere else: never inside a step.
+    mp->SkinVertices(com, world->skinScratch.data(), joint_count, hard_skin_all != 0 || !fedBefore, *world->temp);
+    if (index < world->softBodySkinFed.size()) world->softBodySkinFed[index] = 1;
+    // A sleeping body would not follow the pose it was just given.
+    if (!b.IsActive()) world->system.GetBodyInterfaceNoLock().ActivateBody(b.GetID());
+    return 1;
+}
+
+void ujolt_world_set_soft_body_skin_params(ujolt_world *world, ujolt_body_id body, float max_distance_multiplier, int32_t enable_skin_constraints) {
+    BodyLockWrite lock(world->system.GetBodyLockInterface(), BodyID(body));
+    if (!lock.Succeeded() || !lock.GetBody().IsSoftBody()) return;
+    Body &b = lock.GetBody();
+    auto *mp = static_cast<SoftBodyMotionProperties *>(b.GetMotionProperties());
+    mp->SetSkinnedMaxDistanceMultiplier(std::max(0.0f, max_distance_multiplier));
+    mp->SetEnableSkinConstraints(enable_skin_constraints != 0);
+    if (!b.IsActive()) world->system.GetBodyInterfaceNoLock().ActivateBody(b.GetID());
+}
+
 void ujolt_world_remove_body(ujolt_world *world, ujolt_body_id body) {
     const BodyID id(body);
     {
@@ -781,6 +936,11 @@ void ujolt_world_remove_body(ujolt_world *world, ujolt_body_id body) {
         if (it->second.ragdoll) return; // owned by its ragdoll; goes with it
         world->removedRecords[body] = it->second;
         world->records.erase(it);
+    }
+    // The index is free for another body once this one is destroyed.
+    if (id.GetIndex() < world->softBodyOneWay.size()) {
+        world->softBodyOneWay[id.GetIndex()] = 0;
+        world->softBodySkinFed[id.GetIndex()] = 0;
     }
     BodyInterface &bi = world->system.GetBodyInterface();
     if (bi.IsAdded(id)) {
@@ -969,6 +1129,10 @@ void ujolt_world_step(ujolt_world *world, float dt, int32_t collision_steps) {
                 if (owned) continue;
                 bi.RemoveBody(id);
                 bi.DestroyBody(id);
+                if (id.GetIndex() < world->softBodyOneWay.size()) {
+                    world->softBodyOneWay[id.GetIndex()] = 0;
+                    world->softBodySkinFed[id.GetIndex()] = 0;
+                }
                 std::lock_guard<std::mutex> guard(world->recordMutex);
                 world->records.erase(id.GetIndexAndSequenceNumber());
             }

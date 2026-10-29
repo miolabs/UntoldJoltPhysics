@@ -122,6 +122,27 @@ built against, as the engine's validator demands.
   radius plus the other body's must cover half the particle spacing or the
   body slips through the gaps. The engine seam has no soft-body vocabulary:
   a game reads the vertex positions back each frame and drives a mesh.
+- **Skinned soft bodies** (`JoltSoftBodyDescriptor.skin`, then
+  `JoltPhysicsBackend.skinSoftBody` every frame): cloth worn by an animated
+  character. Each skinned vertex names up to four joints (Jolt's skinned
+  constraints); the game feeds the joints' world transforms before every
+  step — `willStep` is the hook made for it — and Jolt keeps the particle
+  within `maxDistance` of where the skin puts it and outside a back-stop
+  behind the skin, the body underneath. A `maxDistance` of 0 hard skins the
+  vertex: it sits exactly on the skin and loses its mass, so colliders never
+  fight the skin over it. `hardSkinAll` (a teleport) is the only hard reset
+  there is — a body's first feed is one regardless, as Jolt blends the
+  skinned positions from the previous feed's — and, like every skin call,
+  it happens on the frame thread between steps, never inside one.
+  `oneWayAgainstRagdolls` lets
+  ragdoll parts — the only bodies here that carry a Jolt collision group —
+  push the cloth and drag it along by friction while the cloth never pushes
+  them back; every other body still collides both ways. Jolt never wakes a
+  body for its skin, so cloth on a live character sets `allowSleeping`
+  false. `readSoftBodyVertices(_:into:normals:)` returns unit area-weighted
+  normals with the positions, allocating nothing after the first call, and
+  `setSoftBodySkin` scales every slack (0 hard skins the whole body) or
+  switches the skin constraints off.
 - **Character controller** (`JoltPhysicsBackend.addCharacter` /
   `removeCharacter`, then `JoltCharacter.move` / `teleport` / `position` /
   `contacts`): Jolt's `CharacterVirtual`, a capsule or cylinder standing on
@@ -175,7 +196,12 @@ coordinator does: bounce and rest, static boxes, triggers (including exit on
 removal), a kinematic swat, body removal and replacement, raycasts with
 exclusions and layer masks, the layer matrix, capsule/cylinder/convex-hull
 shapes, collider offsets, gravity, and soft bodies (a hanging rope, a sheet
-catching a ball, removal). The character suite walks a controller into a wall
+catching a ball, removal, cloth from triangles following its moved pins and
+colliding with kinematic capsules and hulls). The skinned suite hangs a sheet
+from two joints and checks hard skinning, following moving joints, the
+back-stop, hard-skinned vertices inside a collider, a teleport reset, one-way
+contact against a ragdoll part, the skin parameters, the normals read-back,
+sleep control and the demo's 100 Hz cadence. The character suite walks a controller into a wall
 and along it, over a low box, into a ball it pushes and a ball that bounces
 off it, hits it with a ray, teleports it and removes it. The ragdoll suite
 builds a three-part chain on the floor and checks creation, activation and
