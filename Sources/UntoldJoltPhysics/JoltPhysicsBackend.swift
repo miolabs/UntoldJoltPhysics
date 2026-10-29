@@ -43,7 +43,8 @@ public struct JoltWorldSettings: Sendable {
     /// Jolt sub-steps per engine step (its `collision steps`): the world is
     /// integrated this many times per step at dt / n. More lets joint
     /// motors run stiffer than half the engine's step rate allows — a
-    /// powered ragdoll tracking a fast animation wants three.
+    /// powered ragdoll tracking a fast animation wants three, and so do
+    /// cloth and fast kinematic colliders in a 33 ms frame.
     public var collisionSteps: Int32 = 1
     /// Non-trigger contacts closing slower than this (m/s) are not reported
     /// as `.began`: a resting contact re-established after a sleep or a
