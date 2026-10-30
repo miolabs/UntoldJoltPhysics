@@ -397,6 +397,29 @@ extension JoltPhysicsBackend {
         ujolt_world_body_is_active(worldHandle, body.id) != 0
     }
 
+    /// Puts the body to sleep or wakes it. Asleep, Jolt leaves it out of the
+    /// step altogether — no solve, no collision of its own, no skinning: the
+    /// soft-body jobs take the active soft bodies only — so a resting cloth
+    /// stops costing, and its particles stay where they were. `skinSoftBody`
+    /// and `setSoftBodySkin` wake it (a sleeping body would not follow what
+    /// it was just given), and so does an awake rigid body reaching its
+    /// bounds on a layer the two share: Jolt pairs an active rigid body with
+    /// a sleeping soft body and wakes the soft body before it leaves the pair
+    /// to the soft-body update, so a ball thrown at a sleeping shirt wakes
+    /// it — and a ragdoll part sitting inside it would wake it every step. A
+    /// body to be kept asleep goes on a layer nothing awake meets
+    /// (`setSoftBodyLayer`). Frame thread, between steps.
+    public func setSoftBodyActive(_ body: JoltSoftBody, _ active: Bool) {
+        ujolt_world_set_body_active(worldHandle, body.id, active ? 1 : 0)
+    }
+
+    /// Moves the body to another engine collision layer (0 ... 31): the
+    /// layer matrix then decides what meets it, from the next step. Frame
+    /// thread, between steps.
+    public func setSoftBodyLayer(_ body: JoltSoftBody, _ layer: UInt32) {
+        ujolt_world_set_body_layer(worldHandle, body.id, layer)
+    }
+
     public func removeSoftBody(_ body: JoltSoftBody) {
         ujolt_world_remove_body(worldHandle, body.id)
     }

@@ -13,7 +13,8 @@ import XCTest
 /// feed, following moving joints, the back-stop, hard-skinned vertices
 /// inside a collider, teleport resets, malformed skins, one-way contact
 /// against a ragdoll part, the skin parameters, the normals read-back,
-/// sleep control and the demo's 100 Hz cadence.
+/// sleep control, a body put to sleep and woken, and the demo's 100 Hz
+/// cadence.
 final class JoltSoftBodySkinnedTests: XCTestCase {
     private let step: Float = 1.0 / 60.0
     private let step100: Float = 1.0 / 100.0
@@ -565,6 +566,101 @@ final class JoltSoftBodySkinnedTests: XCTestCase {
         }
         XCTAssertFalse(activeAfterRest(allowSleeping: true), "Jolt sleeps a sheet at rest")
         XCTAssertTrue(activeAfterRest(allowSleeping: false), "unless told not to")
+    }
+
+    /// A resting sheet told to sleep is left out of the step — not a vertex
+    /// moves over a hundred steps, and the world steps in a fraction of the
+    /// time it takes with the sheet awake (both printed) — until it is
+    /// woken: by the call, by a skin feed or by a skin-parameter change,
+    /// after which it follows its joints again.
+    func testASheetPutToSleepCostsNothingUntilItIsWoken() throws {
+        func settled() throws -> (JoltPhysicsBackend, JoltSoftBody) {
+            let backend = makeBackend(collisionSteps: 3)
+            let body = try XCTUnwrap(backend.addSoftBody(sheet()))
+            backend.skinSoftBody(body, jointWorldMatrices: bindPose, hardSkinAll: true)
+            advance(backend, seconds: 1) { backend.skinSoftBody(body, jointWorldMatrices: self.bindPose) }
+            return (backend, body)
+        }
+        /// Microseconds per step over `steps` steps, no feed.
+        func stepMicroseconds(_ backend: JoltPhysicsBackend, steps: Int) -> Double {
+            let started = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< steps { backend.step(deltaTime: step) }
+            return Double(DispatchTime.now().uptimeNanoseconds - started) / 1e3 / Double(steps)
+        }
+        let (resting, sleeper) = try settled()
+        XCTAssertTrue(resting.isSoftBodyActive(sleeper), "never told to sleep, the sheet is awake")
+        resting.setSoftBodyActive(sleeper, false)
+        XCTAssertFalse(resting.isSoftBodyActive(sleeper))
+        let before = positions(resting, sleeper)
+        let asleepMicroseconds = stepMicroseconds(resting, steps: 100)
+        XCTAssertFalse(resting.isSoftBodyActive(sleeper), "nothing in the world woke it")
+        XCTAssertEqual(positions(resting, sleeper), before, "asleep, not a vertex moved")
+
+        let (running, _) = try settled()
+        let awakeMicroseconds = stepMicroseconds(running, steps: 100)
+        print(String(format: "soft body step (%d vertices, 3 iterations, 3 sub-steps, 100 steps): awake %.1f us, asleep %.1f us", rows * columns, awakeMicroseconds, asleepMicroseconds))
+        XCTAssertLessThan(asleepMicroseconds, awakeMicroseconds / 4, "a sleeping sheet costs a fraction of an awake one")
+
+        // Woken by the call, it is Jolt's again.
+        resting.setSoftBodyActive(sleeper, true)
+        XCTAssertTrue(resting.isSoftBodyActive(sleeper))
+        // A skin feed wakes it by itself, and the body follows the joints.
+        resting.setSoftBodyActive(sleeper, false)
+        let moved = pose(offset: SIMD3<Float>(0.1, 0, 0))
+        XCTAssertTrue(resting.skinSoftBody(sleeper, jointWorldMatrices: moved))
+        XCTAssertTrue(resting.isSoftBodyActive(sleeper), "a skin feed wakes the body")
+        advance(resting, seconds: 0.5) { resting.skinSoftBody(sleeper, jointWorldMatrices: moved) }
+        let p = positions(resting, sleeper)
+        XCTAssertTrue(allFinite(p))
+        XCTAssertLessThan(farthest(p, from: cpuSkin(moved), rows: 0 ..< 1), 1e-4, "the hard row followed the joints")
+        XCTAssertLessThan(farthest(p, from: cpuSkin(moved), rows: 1 ..< rows), maxDistance + 0.005, "and the rest stayed within its slack")
+        // So does a change of the skin parameters.
+        resting.setSoftBodyActive(sleeper, false)
+        resting.setSoftBodySkin(sleeper, maxDistanceMultiplier: 1)
+        XCTAssertTrue(resting.isSoftBodyActive(sleeper), "a skin-parameter change wakes the body")
+    }
+
+    /// Jolt wakes a sleeping soft body for any awake rigid body that reaches
+    /// its bounds on a layer the two share — the ball thrown at a sleeping
+    /// shirt, but just as much a ragdoll part sitting inside it — so a body
+    /// to be kept asleep goes on a layer the awake bodies do not meet: there
+    /// the ball falls through the sleeping sheet and the sheet sleeps on.
+    func testAnAwakeRigidBodyWakesASleepingSheetUnlessTheLayersAreClosed() throws {
+        // Layer 1 (the ball's) meets layer 0 (the sheet's); layer 2 meets nothing.
+        var masks = Array(repeating: UInt32.max, count: 32)
+        masks[2] = 0
+        for layer in masks.indices { masks[layer] &= ~(UInt32(1) << 2) }
+        func drop(sheetLayer: UInt32) throws -> (woke: Bool, moved: Float, ballHeight: Float) {
+            let backend = makeBackend()
+            var configuration = PhysicsWorldConfiguration()
+            configuration.collisionLayerMatrix = masks
+            backend.configure(configuration)
+            let body = try XCTUnwrap(backend.addSoftBody(sheet()))
+            backend.skinSoftBody(body, jointWorldMatrices: bindPose, hardSkinAll: true)
+            advance(backend, seconds: 1) { backend.skinSoftBody(body, jointWorldMatrices: self.bindPose) }
+            backend.setSoftBodyLayer(body, sheetLayer)
+            backend.setSoftBodyActive(body, false)
+            let before = positions(backend, body)
+            // A ball above the middle of the sheet, 30 cm up.
+            backend.didAddBody(entity: 7, descriptor: PhysicsBodyDescriptor(
+                motionType: .dynamic,
+                collider: PhysicsColliderDescriptor(shape: .sphere(radius: 0.05), friction: 0.4, restitution: 0.0),
+                mass: 0.2, layer: 1,
+                position: bindPosition(rows / 2, columns / 2) + SIMD3<Float>(0, 0.3, 0)
+            ))
+            var woke = false
+            advance(backend, seconds: 1.5) { woke = woke || backend.isSoftBodyActive(body) }
+            let ball = try XCTUnwrap(backend.bodyState(for: 7))
+            return (woke, farthest(positions(backend, body), from: before), ball.position.y)
+        }
+        let shared = try drop(sheetLayer: 0)
+        XCTAssertTrue(shared.woke, "the ball woke the sleeping sheet through Jolt")
+        XCTAssertGreaterThan(shared.moved, 0.005, "which then caught it: the sheet moved \(shared.moved) m")
+        XCTAssertGreaterThan(shared.ballHeight, origin.y - 0.2, "the ball rests on the sheet at \(shared.ballHeight) m")
+        let closed = try drop(sheetLayer: 2)
+        XCTAssertFalse(closed.woke, "on a layer the ball does not meet, the sheet slept on")
+        XCTAssertEqual(closed.moved, 0, "and not a vertex moved")
+        XCTAssertLessThan(closed.ballHeight, 0.2, "the ball fell through to the floor: \(closed.ballHeight) m")
     }
 
     /// The demo's cadence, one skin feed per step: the joints swing
