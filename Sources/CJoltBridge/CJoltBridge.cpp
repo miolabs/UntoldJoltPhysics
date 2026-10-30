@@ -1085,6 +1085,27 @@ int32_t ujolt_world_body_is_active(const ujolt_world *world, ujolt_body_id body)
     return world->system.GetBodyInterface().IsActive(BodyID(body)) ? 1 : 0;
 }
 
+void ujolt_world_set_body_active(ujolt_world *world, ujolt_body_id body, int32_t active) {
+    BodyInterface &bi = world->system.GetBodyInterface();
+    const BodyID id(body);
+    // Activation asserts the body is in the broad phase: a part of a ragdoll
+    // held out of the world, or a body already removed, is left alone.
+    if (!bi.IsAdded(id)) return;
+    if (active != 0) {
+        bi.ActivateBody(id);
+    } else {
+        bi.DeactivateBody(id);
+    }
+}
+
+void ujolt_world_set_body_layer(ujolt_world *world, ujolt_body_id body, uint32_t layer) {
+    BodyInterface &bi = world->system.GetBodyInterface();
+    const BodyID id(body);
+    if (!bi.IsAdded(id)) return;
+    const bool moving = (uint32_t(bi.GetObjectLayer(id)) & 1u) != 0;
+    bi.SetObjectLayer(id, objectLayer(layer, moving));
+}
+
 void ujolt_world_activate_in_box(ujolt_world *world, const float min[3], const float max[3]) {
     world->system.GetBodyInterface().ActivateBodiesInAABox(
         AABox(v3(min), v3(max)), BroadPhaseLayerFilter(), ObjectLayerFilter());
