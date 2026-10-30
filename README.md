@@ -152,7 +152,16 @@ built against, as the engine's validator demands.
   normals with the positions, allocating nothing after the first call, and
   `setSoftBodySkin` scales every slack (0 hard skins the whole body; below
   a vertex's back-stop ratio its back-stop is off) or switches the skin
-  constraints off.
+  constraints off. `setSoftBodyActive` puts a body to sleep or wakes it
+  (Jolt's DeactivateBody / ActivateBody): asleep, the soft-body jobs skip
+  it — no solve, no collision of its own, no skinning — and its particles
+  stay put, so a resting cloth stops costing. A skin feed or a parameter
+  change wakes it, and so does any awake rigid body reaching its bounds on
+  a layer the two share (Jolt activates a sleeping soft body before it
+  leaves the pair to the soft-body update: a ball thrown at a sleeping
+  shirt wakes it, and a ragdoll part inside the shirt would wake it every
+  step), so `setSoftBodyLayer` moves a body to be kept asleep onto a layer
+  nothing awake meets.
 - **Character controller** (`JoltPhysicsBackend.addCharacter` /
   `removeCharacter`, then `JoltCharacter.move` / `teleport` / `position` /
   `contacts`): Jolt's `CharacterVirtual`, a capsule or cylinder standing on
@@ -211,8 +220,10 @@ colliding with kinematic capsules and hulls). The skinned suite hangs a sheet
 from two joints and checks hard skinning, a step before the first feed,
 following moving joints, the back-stop, hard-skinned vertices inside a
 collider, a teleport reset, malformed skins, one-way contact against a
-ragdoll part, the skin parameters, the normals read-back, sleep control and
-the demo's 100 Hz cadence. The character suite walks a controller into a wall
+ragdoll part, the skin parameters, the normals read-back, sleep control, a
+sheet put to sleep (no vertex moves, the step costs a fraction, a feed wakes
+it) and woken by a ball unless its layer is closed, and the demo's 100 Hz
+cadence. The character suite walks a controller into a wall
 and along it, over a low box, into a ball it pushes and a ball that bounces
 off it, hits it with a ray, teleports it and removes it. The ragdoll suite
 builds a three-part chain on the floor and checks creation, activation and
