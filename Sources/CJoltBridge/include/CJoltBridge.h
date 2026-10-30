@@ -93,6 +93,26 @@ typedef struct ujolt_body_desc {
     uint64_t user_data;           /* the engine entity id */
 } ujolt_body_desc;
 
+/// A vertex skinned to the joints of an animated skeleton: Jolt's skinned
+/// constraint. Every step the game feeds the joints' world matrices
+/// (ujolt_world_skin_soft_body); the bridge skins the vertex's rest
+/// position with them and the solver keeps the simulated particle within
+/// max_distance of that skinned position and outside a back-stop sphere
+/// behind it (the body the cloth is worn over), or exactly on it when
+/// max_distance is 0. "Behind" is against the skin's normal, which Jolt
+/// takes from the faces around the vertex whose three vertices are all
+/// skinned, wound counter-clockwise seen from outside the cloth; a
+/// back-stopped vertex with no such face is refused.
+typedef struct ujolt_soft_body_skin_vertex {
+    uint32_t vertex;             /* index into the descriptor's vertices */
+    uint32_t joints[4];          /* up to four joints, read up to the first zero weight */
+    float weights[4];            /* normalised by the bridge */
+    float max_distance;          /* 0 = hard skinned: the bridge also sets its inverse mass to 0 */
+    float backstop_distance;     /* behind the skinned vertex, against its normal; disabled when
+                                    >= max_distance x the skin's max-distance multiplier */
+    float backstop_radius;       /* 40 approximates a plane */
+} ujolt_soft_body_skin_vertex;
+
 /// A soft body: particles joined by distance constraints (Jolt's own XPBD),
 /// optional triangles for surface collision. Vertices are relative to
 /// `position`; the body never moves as a whole (`position` is its frame),
@@ -105,7 +125,8 @@ typedef struct ujolt_soft_body_desc {
     const float *edge_compliances; /* per edge, or NULL -> compliance */
     float compliance;              /* inverse stiffness, m/N; 0 = rigid */
     uint32_t edge_count;
-    const uint32_t *faces;         /* index triples; optional */
+    const uint32_t *faces;         /* index triples; optional. Counter-clockwise seen from
+                                      outside: a skin's back-stop lies behind their normal */
     uint32_t face_count;
     float position[3];
     uint32_t layer;                /* engine collision layer 0..31 */
@@ -116,6 +137,44 @@ typedef struct ujolt_soft_body_desc {
     float restitution;
     float gravity_factor;
     uint64_t user_data;
+    /* Cloth from triangles: when non-zero, the distance, shear and bend
+       constraints are built from `faces` (Jolt's CreateConstraints with
+       dihedral bends) using `compliance`, `shear_compliance` and
+       `bend_compliance`, and `edges` is ignored. */
+    int32_t constraints_from_faces;
+    float shear_compliance;
+    float bend_compliance;
+    /* Ceiling on a vertex's speed (m/s); <= 0 -> Jolt's default. Bounds the
+       energy a resolved overlap or a yanked pin can put into the body. */
+    float max_linear_velocity;
+    /* Bend constraints derived from the faces: 0 = dihedral (angle between
+       neighbouring triangles, stiffer, less stable when pins move fast),
+       1 = distance (across the shared edge, robust). */
+    int32_t bend_type;
+    /* Skinning (Jolt's skinned constraints). inv_bind holds joint_count 4x4
+       matrices, 16 floats each, column-major: each takes a vertex in the
+       descriptor's vertex frame (relative to position) to its joint's
+       space. skinned_count > 0 requires face_count > 0 (the back-stop
+       normals come from the faces) and joint_count > 0. The body is created
+       skinned to its bind pose, so a step before its first feed is sound. */
+    const float *inv_bind;
+    uint32_t joint_count;
+    const ujolt_soft_body_skin_vertex *skinned;
+    uint32_t skinned_count;
+    /* 0/1: whether Jolt may put the body to sleep at rest. Jolt never wakes
+       a body for its skin, so cloth on a live character passes 0 rather
+       than rely on the feed waking it every frame. */
+    int32_t allow_sleeping;
+    /* 0/1: ragdoll parts push this body and it never pushes them (their
+       inverse mass is scaled to 0 in the contact, so a moving dynamic part
+       still drags it by friction; a kinematic part only pushes); every
+       other body collides both ways. The one gap is Jolt's continuous
+       collision: a dynamic part moving more than three quarters of its
+       inner radius in a sub-step is still placed at the time of impact
+       with the cloth for that sub-step (no impulse, but the rest of that
+       sub-step's travel is lost); raise collision_steps or turn continuous
+       collision off if it shows. */
+    int32_t one_way_against_ragdolls;
 } ujolt_soft_body_desc;
 
 typedef enum ujolt_contact_phase {
@@ -167,6 +226,32 @@ uint32_t ujolt_world_soft_body_vertex_count(ujolt_world *world, ujolt_body_id bo
 /// World-space vertex positions, xyz triples. Returns the count written
 /// (capped at capacity).
 uint32_t ujolt_world_read_soft_body_vertices(ujolt_world *world, ujolt_body_id body, float *positions, uint32_t capacity);
+/// Moves `count` vertices (by index) to world-space positions (xyz triples)
+/// and clears their velocity; meant for pinned vertices that ride on
+/// something animated. Returns the count applied.
+uint32_t ujolt_world_set_soft_body_vertices(ujolt_world *world, ujolt_body_id body, const uint32_t *indices, const float *positions, uint32_t count);
+/// Feeds the joints for this step: joint_count world-space 4x4 matrices,
+/// 16 floats each, column-major; the bridge makes them relative to the
+/// body's centre of mass. hard_skin_all places every skinned vertex on its
+/// skinned position and zeroes its velocity (a teleport); a body's first
+/// feed is a hard skin whatever it says, since Jolt blends the skinned
+/// positions from the previous feed's and there is none yet (the body is
+/// created skinned to its bind pose, so a step before that feed is sound).
+/// Frame thread, between steps only, never from inside a step. Returns 0
+/// when the body is not a skinned soft body, a matrix is not finite or
+/// joint_count does not cover the skin's joints (nothing is applied then),
+/// 1 otherwise.
+int32_t ujolt_world_skin_soft_body(ujolt_world *world, ujolt_body_id body, const float *joint_world_matrices, uint32_t joint_count, int32_t hard_skin_all);
+/// Jolt's SetSkinnedMaxDistanceMultiplier (scales every skinned vertex's
+/// max_distance; 0 hard skins everything, and a multiplier below a vertex's
+/// backstop_distance / max_distance switches that back-stop off) and
+/// SetEnableSkinConstraints (off, only the hard-skinned vertices still
+/// follow the skin). A non-finite multiplier applies nothing.
+void ujolt_world_set_soft_body_skin_params(ujolt_world *world, ujolt_body_id body, float max_distance_multiplier, int32_t enable_skin_constraints);
+/// World-space vertex positions (xyz triples) and, when normals is not
+/// NULL, unit area-weighted vertex normals from the body's faces (a vertex
+/// on no face gets +Y). Returns the count written (capped at capacity).
+uint32_t ujolt_world_read_soft_body_vertices_and_normals(ujolt_world *world, ujolt_body_id body, float *positions, float *normals, uint32_t capacity);
 uint32_t ujolt_world_body_count(const ujolt_world *world);
 uint64_t ujolt_world_get_user_data(const ujolt_world *world, ujolt_body_id body);
 

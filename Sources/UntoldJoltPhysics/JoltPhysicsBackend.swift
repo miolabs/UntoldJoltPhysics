@@ -43,7 +43,8 @@ public struct JoltWorldSettings: Sendable {
     /// Jolt sub-steps per engine step (its `collision steps`): the world is
     /// integrated this many times per step at dt / n. More lets joint
     /// motors run stiffer than half the engine's step rate allows — a
-    /// powered ragdoll tracking a fast animation wants three.
+    /// powered ragdoll tracking a fast animation wants three, and so do
+    /// cloth and fast kinematic colliders in a 33 ms frame.
     public var collisionSteps: Int32 = 1
     /// Non-trigger contacts closing slower than this (m/s) are not reported
     /// as `.began`: a resting contact re-established after a sleep or a
@@ -116,6 +117,12 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
     private var changedScratch: [ujolt_body_id]
     private var contactScratch: [ujolt_contact_event]
     private var activationScratch: [ujolt_activation_event]
+
+    /// Called at the top of every `step`, with the step's delta, after the
+    /// pending environment is applied and before Jolt runs: where a game
+    /// pushes this frame's joints into its skinned soft bodies
+    /// (`skinSoftBody`), which must happen between steps. Frame thread.
+    public var willStep: ((Float) -> Void)?
 
     public init(settings: JoltWorldSettings = JoltWorldSettings()) {
         collisionSteps = max(settings.collisionSteps, 1)
@@ -276,6 +283,7 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
 
     public func step(deltaTime: Float) {
         applyPendingEnvironment()
+        willStep?(deltaTime)
         ujolt_world_step(world, deltaTime, collisionSteps)
     }
 
