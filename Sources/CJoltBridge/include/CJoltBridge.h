@@ -264,6 +264,23 @@ void ujolt_world_set_velocity(ujolt_world *world, ujolt_body_id body, const floa
 void ujolt_world_get_transform(const ujolt_world *world, ujolt_body_id body, float position[3], float rotation[4]);
 void ujolt_world_get_velocity(const ujolt_world *world, ujolt_body_id body, float linear[3], float angular[3]);
 int32_t ujolt_world_body_is_active(const ujolt_world *world, ujolt_body_id body);
+/// Puts a body to sleep (0) or wakes it (1): Jolt's DeactivateBody and
+/// ActivateBody, for a soft body as much as a rigid one. Asleep, a body is
+/// left out of the step — no integration, no constraints, no collision of
+/// its own, and for a soft body no solve and no skinning — until something
+/// wakes it: this call, a skin feed or a skin-parameter change (the bridge
+/// wakes the body for those, as a sleeping body would not follow what it
+/// was just given), or an awake rigid body reaching its bounds on a layer
+/// the two share: Jolt pairs an active rigid body with a sleeping soft body
+/// and activates the soft body before it leaves the pair to the soft-body
+/// update (PhysicsSystem::ProcessBodyPair). A body to be kept asleep sits on
+/// a layer nothing awake meets (ujolt_world_set_body_layer). Frame thread,
+/// between steps.
+void ujolt_world_set_body_active(ujolt_world *world, ujolt_body_id body, int32_t active);
+/// Moves a body to another engine layer (0..31), keeping whether it counts
+/// as moving; the broad phase follows at once and the layer matrix decides
+/// what meets it from the next step. Frame thread, between steps.
+void ujolt_world_set_body_layer(ujolt_world *world, ujolt_body_id body, uint32_t layer);
 
 /// Wakes every body overlapping the world-space box [min, max] — call before
 /// removing static geometry a sleeping body may be resting on.
